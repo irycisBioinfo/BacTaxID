@@ -4,6 +4,7 @@ use petgraph::graph::{Graph, NodeIndex};
 use petgraph::Undirected;
 use petgraph::algo::clique::BronKerboschAllCliques;
 use std::collections::HashMap;
+use duckdb::{Connection, Result, params};
 
 /// Busca un clique y devuelve los nodos y los IDs únicos de los edges usados
 ///
@@ -152,3 +153,26 @@ pub fn get_edges_by_node_ids_and_dist(
     }
     Ok(result)
 }
+
+
+/// Inserta un vector de edges (source, target, dist) en la tabla edges de DuckDB.
+/// 
+/// # Parámetros
+/// - conn: conexión activa a DuckDB
+/// - edges: slice de tuplas (source, target, dist)
+/// 
+/// # Nota
+/// - La tabla debe tener columnas source (VARCHAR), target (VARCHAR), dist (DOUBLE)
+pub fn insert_edges(
+    conn: &Connection,
+    edges: &[(String, String, f64)]
+    ) -> Result<()> {
+    let sql = "INSERT INTO edges (source, target, dist) VALUES (?, ?, ?)";
+    let mut stmt = conn.prepare(sql)?;
+
+    for (source, target, dist) in edges {
+        stmt.execute(params![source, target, dist])?;
+    }
+    Ok(())
+}
+

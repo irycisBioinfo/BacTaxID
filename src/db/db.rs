@@ -1,6 +1,8 @@
-use duckdb::{Connection, Result, params};
+use duckdb::{Connection, Result, params, params_from_iter};
 use serde::Deserialize;
 use std::fs;
+// use std::fmt::Write;
+// use std::error::Error;
 
 #[derive(Deserialize, Debug)]
 pub struct MetadataConfig {
@@ -362,6 +364,129 @@ impl DuckDb {
         &self.conn
     }
 }
+
+
+/// Inserta una fila en la tabla code-like (code, code_full o code_state)
+/// con el campo sample igual a `sample_id` y el resto de columnas como NULL.
+/// Asume que el nombre de la columna ID es `sample` y el resto de las columnas pueden variar y están después.
+pub fn insert_empty_entry_code_table(
+    conn: &Connection,
+    table_name: &str,
+    sample_id: &str
+) -> Result<()> {
+    // Obtiene todas las columnas menos la primaria (sample)
+    let mut stmt = conn.prepare(&format!(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_name = ? AND column_name != 'sample' ORDER BY ordinal_position"
+    ))?;
+    let columns: Vec<String> = stmt.query_map([table_name], |row| row.get(0))?
+        .flatten()
+        .collect();
+    let n = columns.len();
+
+    // Construye el SQL: INSERT INTO table (sample, col1, col2, ...) VALUES (?, NULL, NULL, ...)
+    let columns_sql = if n > 0 {
+        format!(", {}", columns.join(", "))
+    } else { "".to_string() };
+    let nulls: String = if n > 0 {
+        std::iter::repeat("NULL").take(n).collect::<Vec<_>>().join(", ")
+    } else { "".to_string() };
+    let sql = format!(
+        "INSERT INTO {table} (sample{columns}) VALUES (?{nulls})",
+        table=table_name,
+        columns=columns_sql,
+        nulls=if n>0 { format!(", {nulls}") } else { "".to_string() },
+    );
+    // println!("SQL: {sql}");
+    conn.execute(&sql, params![sample_id])?;
+    Ok(())
+}
+
+pub fn insert_empty_code(conn: &Connection, sample_id: &str) -> Result<()> {
+    insert_empty_entry_code_table(conn, "code", sample_id)
+}
+pub fn insert_empty_code_full(conn: &Connection, sample_id: &str) -> Result<()> {
+    insert_empty_entry_code_table(conn, "code_full", sample_id)
+}
+pub fn insert_empty_code_state(conn: &Connection, sample_id: &str) -> Result<()> {
+    insert_empty_entry_code_table(conn, "code_state", sample_id)
+}
+
+
+pub fn copy_l_fields_up_to(
+    conn: &Connection,
+    table_name: &str,
+    input_id: &str,
+    ref_id: &str,
+    l: usize,
+) -> Result<()> {
+    // Genera lista de columnas L_0 a L_L
+    let columns: Vec<String> = (0..=l).map(|i| format!("L_{}", i)).collect();
+    
+    // Construye SQL UPDATE
+    let mut set_expr = String::new();
+    for (i, col) in columns.iter().enumerate() {
+        if i > 0 {
+            set_expr.push_str(", ");
+        }
+        set_expr.push_str(&format!("{} = ?", col));
+    }
+
+    let sql = format!(
+        "UPDATE {table} SET {set_expr} WHERE sample = ?",
+        table = table_name,
+        set_expr = set_expr
+    );
+
+    // Recupera los valores de ref_id
+    let select_sql = format!(
+        "SELECT {} FROM {} WHERE sample = ?",
+        columns.join(","),
+        table_name
+    );
+    
+    let mut stmt = conn.prepare(&select_sql)?;
+    let values_row = stmt.query_row([ref_id], |row| {
+        (0..=l).map(|i| row.get::<_, Option<String>>(i)).collect::<Result<Vec<_>, _>>()
+    })?;
+
+    // Haz el UPDATE usando params_from_iter
+    if values_row.len() == l + 1 {
+        // Crear vector de parámetros
+        let mut params: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
+        
+        // Agregar todos los valores L_0..L_L
+        for value in values_row {
+            if let Some(v) = value {
+                params.push(Box::new(v));
+            } else {
+                params.push(Box::new(None::<String>));
+            }
+        }
+        
+        // Agregar el input_id al final
+        params.push(Box::new(input_id.to_string()));
+
+        // Usar params_from_iter para ejecutar
+        let mut stmt2 = conn.prepare(&sql)?;
+        stmt2.execute(params_from_iter(params))?;
+        
+        Ok(())
+    } else {
+        Err(duckdb::Error::ToSqlConversionFailure(
+            format!("No se obtuvieron L_0..L_{l} para sample '{ref_id}'").into()
+        ))      
+    }
+}
+pub fn copy_code_l_fields_up_to(conn: &Connection, input_id: &str, ref_id: &str, l: usize) -> Result<()> {
+    copy_l_fields_up_to(conn, "code", input_id, ref_id, l)
+}
+
+pub fn copy_code_full_l_fields_up_to(conn: &Connection, input_id: &str, ref_id: &str, l: usize) -> Result<()> {
+    copy_l_fields_up_to(conn, "code_full", input_id, ref_id, l)
+}
+
+
 
 #[cfg(test)]
 mod tests {
