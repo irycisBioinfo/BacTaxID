@@ -3,7 +3,6 @@ use hashbrown::HashMap;
 use petgraph::graph::{Graph, NodeIndex};
 use petgraph::Undirected;
 use petgraph::algo::clique::BronKerboschAllCliques;
-use std::collections::HashMap;
 use duckdb::{Connection, Result, params};
 
 /// Busca un clique y devuelve los nodos y los IDs únicos de los edges usados

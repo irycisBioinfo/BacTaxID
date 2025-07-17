@@ -185,7 +185,7 @@ impl DuckDb {
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(e.to_string().into()))?;
 
         // 2. Generar el nombre de la base de datos basado en el genus
-        let db_name = format!("{}_bactaxid.db", config.genus);
+        let db_name = format!("{}_bactaxid.db", config.acronym);
         
         // 3. Crear una nueva instancia de DuckDb con el nombre generado
         let db = Self::new(&db_name)?;
