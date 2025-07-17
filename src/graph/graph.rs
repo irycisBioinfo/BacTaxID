@@ -1,89 +1,102 @@
-use rayon::prelude::*;
 use hashbrown::HashMap;
-use petgraph::graph::{Graph, NodeIndex};
-use petgraph::Undirected;
-use petgraph::algo::clique::BronKerboschAllCliques;
+use petgraph::{
+    algo::maximal_cliques::maximal_cliques,
+    graph::{Graph, NodeIndex},
+    Undirected,
+};
 use duckdb::{Connection, Result, params};
 
-/// Busca un clique y devuelve los nodos y los IDs únicos de los edges usados
-///
-/// # Parámetros:
-/// - conn: &Connection (DuckDB)
-/// - ids: &[i64]        -- IDs a considerar como nodos
-/// - dist_max: f64      -- valor máximo de Dist
-/// - click_size: usize  -- tamaño mínimo del clique buscado
-///
-/// # Devuelve:
-/// - Option<(Vec<i64>, Vec<i64>)> : (IDs de nodos, IDs de edges usados), o None si no hay clique
+/// Devuelve `Some((nodos, edges))` si hay un clique ≥ `click_size`, o `None` si no lo hay.
+/// * `ids`      – lista de IDs (VARCHAR) a considerar.
+/// * `dist_max` – umbral máximo para la columna `dist`.
+/// * `click_size` – tamaño mínimo del clique buscado.
 pub fn exists_clique(
     conn: &Connection,
-    ids: &[i64],
+    ids: &[String],
     dist_max: f64,
-    click_size: usize
-) -> Result<Option<(Vec<i64>, Vec<i64>)>> {
+    click_size: usize,
+) -> Result<Option<(Vec<String>, Vec<i64>)>> {
     if ids.is_empty() || click_size == 0 {
         return Ok(None);
     }
 
-    // 1. Prepara IDs para consulta SQL
-    let id_list = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
-    let query = format!(
-        "SELECT id, source, target FROM edges \
-         WHERE source IN ({0}) AND target IN ({0}) AND dist < ?",
-         id_list
+    /* ---------- 1. Consulta SQL filtrada ---------- */
+    let placeholders = ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT id, source, target       \
+         FROM edges                     \
+         WHERE source IN ({})           \
+           AND target IN ({})           \
+           AND dist < ?",
+        placeholders, placeholders
     );
-    let mut stmt = conn.prepare(&query)?;
-    let rows = stmt.query_map([dist_max], |row| {
-        let row_id: i64 = row.get(0)?;
-        let src: i64 = row.get(1)?;
-        let tgt: i64 = row.get(2)?;
-        Ok((row_id, src, tgt))
+
+    /* parámetros: ids para source, ids para target, dist_max */
+    let mut params: Vec<&dyn duckdb::ToSql> =
+        ids.iter().map(|s| s as &dyn duckdb::ToSql).collect();
+    params.extend(ids.iter().map(|s| s as &dyn duckdb::ToSql));
+    params.push(&dist_max);
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,     // id fila
+            row.get::<_, String>(1)?,  // source
+            row.get::<_, String>(2)?,  // target
+        ))
     })?;
 
-    // 2. Arma el grafo y un lookup de aristas -> IDs originales
-    let mut id_to_index: HashMap<i64, NodeIndex> = HashMap::new();
-    let mut index_to_id: Vec<i64> = Vec::new();
-    let mut graph = Graph::<i64, i64, Undirected>::new_undirected();
-    // Nodos
-    for &id in ids {
-        let idx = graph.add_node(id);
-        id_to_index.insert(id, idx);
-        index_to_id.push(id);
+    /* ---------- 2. Construcción del grafo ---------- */
+    let mut g: Graph<String, i64, Undirected> = Graph::new_undirected();
+    let mut id2idx: HashMap<String, NodeIndex> = HashMap::new();
+
+    for id in ids {
+        let n = g.add_node(id.clone());
+        id2idx.insert(id.clone(), n);
     }
-    // Mapea (src, tgt) -> edge_id
-    let mut edge_id_lookup: HashMap<(i64, i64), i64> = HashMap::new();
-    // Aristas
+
+    let mut edge_lookup: HashMap<(String, String), i64> = HashMap::new();
+
     for row in rows.flatten() {
-        let (row_id, src, tgt) = row;
-        if let (Some(&a), Some(&b)) = (id_to_index.get(&src), id_to_index.get(&tgt)) {
-            graph.update_edge(a, b, row_id);
-            // Para consulta rápida posterior
-            let mut key = (src, tgt);
-            // Siempre ordena el par (por si el grafo es no dirigido)
-            if key.0 > key.1 { std::mem::swap(&mut key.0, &mut key.1); }
-            edge_id_lookup.insert(key, row_id);
+        let (edge_id, s, t) = row;
+        if let (Some(&a), Some(&b)) = (id2idx.get(&s), id2idx.get(&t)) {
+            g.update_edge(a, b, edge_id);
+            let key = if s <= t { (s.clone(), t) } else { (t, s) };
+            edge_lookup.insert(key, edge_id);
         }
     }
-    // 3. Busca los cliques
-    for clique_indices in BronKerboschAllCliques::new(&graph).filter(|c| c.len() >= click_size) {
-        // IDs de los nodos del clique
-        let clique_node_ids: Vec<i64> = clique_indices.iter().map(|ix| graph[*ix]).collect();
-        // IDs de los edges usados en ese clique (todas las conexiones pares dentro del clique)
-        let mut clique_edge_ids = Vec::new();
-        for i in 0..clique_node_ids.len() {
-            for j in (i+1)..clique_node_ids.len() {
-                let mut key = (clique_node_ids[i], clique_node_ids[j]);
-                if key.0 > key.1 { std::mem::swap(&mut key.0, &mut key.1); }
-                if let Some(&eid) = edge_id_lookup.get(&key) {
-                    clique_edge_ids.push(eid);
+
+    /* ---------- 3. Búsqueda de cliques ---------- */
+    for clique in maximal_cliques(&g) {
+        if clique.len() >= click_size {
+            /* Recuperar IDs de nodos */
+            let mut nodes: Vec<String> = clique.iter().map(|&ix| g[ix].clone()).collect();
+            nodes.sort();
+
+            /* Recuperar IDs de edges del clique */
+            let mut edges = Vec::<i64>::new();
+            for i in 0..nodes.len() {
+                for j in (i + 1)..nodes.len() {
+                    let key = if nodes[i] <= nodes[j] {
+                        (nodes[i].clone(), nodes[j].clone())
+                    } else {
+                        (nodes[j].clone(), nodes[i].clone())
+                    };
+                    if let Some(&eid) = edge_lookup.get(&key) {
+                        edges.push(eid);
+                    }
                 }
             }
+            return Ok(Some((nodes, edges)));
         }
-        return Ok(Some((clique_node_ids, clique_edge_ids)));
     }
+
     Ok(None)
 }
-
 
 
 /// Elimina de la tabla 'edges' todas las filas cuyo ID esté en `edge_ids`.
@@ -97,19 +110,34 @@ pub fn exists_clique(
 ///
 /// # Nota:
 /// Si el vector está vacío, la función no hace nada.
-pub fn delete_edges_by_ids(conn: &Connection, edge_ids: &[i64]) -> Result<()> {
+/// Elimina de la tabla 'edges' todas las filas cuyo ID esté en `edge_ids`.
+/// Elimina de la tabla 'edges' todas las filas cuyo ID esté en `edge_ids`.
+pub fn delete_edges_by_ids(conn: &mut Connection, edge_ids: &[i64]) -> Result<()> {
     if edge_ids.is_empty() {
         return Ok(());
     }
-    // Construye la lista de "?, ?, ?, ..." según el número de elementos
-    let placeholders = edge_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-    let sql = format!("DELETE FROM edges WHERE id IN ({})", placeholders);
-
-    // duckdb::params! requiere ownership, así que mapeamos los i64 a Value
-    let params: Vec<&dyn rusqlite::ToSql> = edge_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-
-    // Usando execute con parámetros por posición
-    conn.execute(sql.as_str(), edge_ids)?;
+    
+    let tx = conn.transaction()?;
+    
+    // Crear tabla temporal con nombre único
+    let temp_table = format!("temp_ids_{}", std::process::id());
+    tx.execute_batch(&format!("CREATE TEMP TABLE {} (id INTEGER)", temp_table))?;
+    
+    // Insertar IDs en la tabla temporal
+    let mut stmt = tx.prepare(&format!("INSERT INTO {} (id) VALUES (?)", temp_table))?;
+    for &id in edge_ids {
+        stmt.execute(params![id])?;
+    }
+    
+    // Usar JOIN para eliminar en una sola operación
+    let deleted_count = tx.execute(&format!("DELETE FROM edges WHERE id IN (SELECT id FROM {})", temp_table), [])?;
+    
+    // Limpiar tabla temporal
+    tx.execute(&format!("DROP TABLE {}", temp_table), [])?;
+    
+    tx.commit()?;
+    
+    println!("✓ Eliminadas {} filas de la tabla edges", deleted_count);
     Ok(())
 }
 
@@ -139,7 +167,7 @@ pub fn get_edges_by_node_ids_and_dist(
     let mut stmt = conn.prepare(&sql)?;
     let mut result = Vec::new();
 
-    let rows = stmt.query_map(params, |row| {
+    let rows = stmt.query_map(params.as_slice(), |row| {
         Ok((
             row.get::<_, String>(0)?, // source
             row.get::<_, String>(1)?, // target

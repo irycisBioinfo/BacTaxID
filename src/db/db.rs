@@ -255,7 +255,7 @@ impl DuckDb {
         Ok(())
     }
 
-    fn init_all_tables_from_config(&self, config: &MetadataConfig) -> Result<()> {
+    pub fn init_all_tables_from_config(&self, config: &MetadataConfig) -> Result<()> {
         // 2. Parsear el campo levels usando función asociada
         let levels_vec = Self::parse_levels_string(&config.levels)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(e))?;
