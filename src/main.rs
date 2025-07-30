@@ -6,7 +6,7 @@ mod sketch;
 mod graph;
 mod commands;
 
-use commands::{init_command, verify_init_files};
+use commands::{init_command, verify_init_files, update_command};
 
 #[derive(Parser)]
 #[command(name = "bactaxid")]

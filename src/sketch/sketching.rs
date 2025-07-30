@@ -7,7 +7,7 @@ use serde::*;
 use std::fs::File;
 use std::io::{BufWriter,BufReader};
 use rayon::prelude::*;
-
+use anyhow::{Result, Context, anyhow, bail};
 
 use std::{
     error::Error,
@@ -34,7 +34,7 @@ impl Sketch {
         fasta_path: P,
         kmer_size: usize,
         sketch_size: usize,
-    ) -> Result<Self, Box<dyn Error>> {
+    ) -> Result<Self> {
         // Generar el sketch usando la función binwise_minhash
         let sketch = binwise_minhash(&fasta_path, kmer_size, sketch_size)?;
         
@@ -95,13 +95,16 @@ impl SketchManager {
         }
     }
 
+    pub fn length(&self) -> usize {
+        self.sketches.len()
+    }
     /// 2. Añade un nuevo sketch al HashMap
-    pub fn add_sketch(&mut self, sketch: Sketch) -> Result<(), Box<dyn Error>> {
+    pub fn add_sketch(&mut self, sketch: Sketch) -> Result<()> {
         let name = sketch.name.clone();
         
-        // Verificar si ya existe un sketch con el mismo nombre
+        // ✅ SOLUCIÓN: Usar bail! en lugar de format!().into()
         if self.sketches.contains_key(&name) {
-            return Err(format!("Sketch con nombre '{}' ya existe", name).into());
+            bail!("Sketch con nombre '{}' ya existe", name);
         }
 
         self.sketches.insert(name, sketch);
@@ -112,11 +115,10 @@ impl SketchManager {
     pub fn add_sketch_from_file<P: AsRef<Path>>(
         &mut self,
         fasta_path: P,
-        kmer_size: Option<usize>,
-        sketch_size: Option<usize>,
-    ) -> Result<(), Box<dyn Error>> {
-        let k = kmer_size.unwrap_or(self.default_kmer_size);
-        let s = sketch_size.unwrap_or(self.default_sketch_size);
+        
+    ) -> Result<()> {
+            let k = self.default_kmer_size;
+            let s = self.default_sketch_size;
         
         let sketch = Sketch::new(fasta_path, k, s)?;
         self.add_sketch(sketch)
@@ -143,21 +145,22 @@ impl SketchManager {
     }
 
     /// Calcula la distancia entre dos sketches por nombre
-    pub fn distance_between(&self, name1: &str, name2: &str) -> Result<f64, Box<dyn Error>> {
+    pub fn distance_between(&self, name1: &str, name2: &str) -> Result<f64> {
         let sketch1 = self.sketches.get(name1)
-            .ok_or_else(|| format!("Sketch '{}' no encontrado", name1))?;
+            .ok_or_else(|| anyhow!("Sketch '{}' no encontrado", name1))?;  // ← así sí
+
         let sketch2 = self.sketches.get(name2)
-            .ok_or_else(|| format!("Sketch '{}' no encontrado", name2))?;
+            .ok_or_else(|| anyhow!("Sketch '{}' no encontrado", name2))?;
 
         if !sketch1.is_compatible(sketch2) {
-            return Err("Los sketches no son compatibles (diferentes k-mer o sketch size)".into());
+            anyhow::bail!("Los sketches no son compatibles (diferentes k-mer o sketch size)");
         }
 
         Ok(sketch1.distance(sketch2))
     }
 
     /// 3. Guarda el HashMap en disco usando bincode
-    pub fn save_to_disk<P: AsRef<Path>>(&self, file_path: P) -> Result<(), Box<dyn Error>> {
+    pub fn save_to_disk<P: AsRef<Path>>(&self, file_path: P) -> Result<()> {
         let file = File::create(file_path)?;
         let writer = BufWriter::new(file);
         
@@ -168,7 +171,7 @@ impl SketchManager {
     }
 
     /// 4. Carga el HashMap desde disco usando bincode
-    pub fn load_from_disk<P: AsRef<Path>>(file_path: P) -> Result<Self, Box<dyn Error>> {
+    pub fn load_from_disk<P: AsRef<Path>>(file_path: P) -> Result<Self> {
         let file = File::open(file_path)?;
         let reader = BufReader::new(file);
         
@@ -188,7 +191,7 @@ impl SketchManager {
         file_path: P,
         default_kmer_size: usize,
         default_sketch_size: usize,
-    ) -> Result<Self, Box<dyn Error>> {
+    ) -> Result<Self> {
         if Self::file_exists(&file_path) {
             Self::load_from_disk(file_path)
         } else {
@@ -207,7 +210,7 @@ pub fn binwise_minhash<P: AsRef<Path>>(
     fasta_path: P,
     k: usize,
     sketch_size: usize,
-) -> Result< Vec<u64>, Box<dyn Error>> {
+) -> Result<Vec<u64>> {
     // Número de bins = sketch_size; tamaño del espacio de hash (u64::MAX+1)
     let bins = sketch_size;
     let bin_size = (u64::MAX / bins as u64).saturating_add(1);

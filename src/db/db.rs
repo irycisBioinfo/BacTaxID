@@ -30,8 +30,9 @@ impl DuckDb {
     /// Crea la tabla `edges` con las columnas especificadas si no existe.
     pub fn init_edges_table(&self) -> Result<()> {
         let schema_sql = "
+            CREATE SEQUENCE id_sequence START 1;
             CREATE TABLE IF NOT EXISTS edges (
-                id INTEGER PRIMARY KEY,
+                id INTEGER PRIMARY KEY DEFAULT nextval('id_sequence'),
                 source VARCHAR,
                 target VARCHAR,
                 dist DOUBLE
