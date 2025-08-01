@@ -267,6 +267,93 @@ pub fn min_tuple_owned(
         .cloned()                                      // ← mueve (clona) toda la tupla
 }
 
+
+/// Devuelve los IDs (sample) de filas de `code` que coinciden con el vector de entrada
+/// en las columnas L_0..L_N (solo valores != 0), y que 
+/// en `code_state` tienen "C" en la columna L_{state_level}.
+///
+/// - `conn`: conexión DuckDB
+/// - `levels`: vector con valores de L_0..L_N (los 0 son comodín, no filtran)
+/// - `state_level`: índice del nivel para code_state (ej: 3 para L_3)
+pub fn find_matching_ids_by_levels_and_state(
+    conn: &Connection,
+    levels: &[i64],
+    state_level: usize,
+) -> Result<Vec<String>> {
+    // Construir condiciones sólo para los niveles != 0
+    let mut conditions = Vec::new();
+    let mut params: Vec<&dyn duckdb::ToSql> = Vec::new();
+    for (i, &val) in levels.iter().enumerate() {
+        if val != 0 {
+            let col = format!("L_{}", i);
+            conditions.push(format!("code.{} = ?", col));
+            params.push(&val);
+        }
+    }
+
+    if conditions.is_empty() {
+        bail!("El vector de niveles no tiene ningún valor distinto de cero; no se puede construir consulta.");
+    }
+
+    // Condición de estado (que code_state.L_x = 'C')
+    let state_col = format!("L_{}", state_level);
+    conditions.push(format!("cs.{} = 'C'", state_col));
+
+    let where_clause = conditions.join(" AND ");
+    let sql = format!(
+        "SELECT code.sample \
+         FROM code \
+         JOIN code_state cs ON code.sample = cs.sample \
+         WHERE {}",
+        where_clause
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params.as_slice())?;
+
+    let mut result = Vec::new();
+    while let Some(row) = rows.next()? {
+        result.push(row.get(0)?);
+    }
+    Ok(result)
+}
+
+/// Devuelve los IDs (sample) de las filas de la tabla 'code'
+/// que coinciden con el vector de entrada en las columnas L_0, L_1, ..., L_N,
+/// pero solo se filtra por aquellas posiciones cuyo valor es distinto de 0.
+/// 
+/// - `conn`: conexión a DuckDB
+/// - `levels`: vector de valores para L_0..L_N
+pub fn find_matching_ids_by_levels(conn: &Connection, levels: &[i64]) -> Result<Vec<String>> {
+    // Construimos cláusulas dinámicas solo para los valores != 0
+    let mut conditions = Vec::new();
+    let mut params: Vec<&dyn duckdb::ToSql> = Vec::new();
+    for (i, &val) in levels.iter().enumerate() {
+        if val != 0 {
+            let col = format!("L_{}", i);
+            conditions.push(format!("{} = ?", col));
+            params.push(&val);
+        }
+    }
+
+    if conditions.is_empty() {
+        bail!("El vector de niveles no tiene ningún valor distinto de cero; no se puede construir consulta.");
+    }
+
+    let where_clause = conditions.join(" AND ");
+    let sql = format!("SELECT sample FROM code WHERE {}", where_clause);
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params.as_slice())?;
+
+    let mut result = Vec::new();
+    while let Some(row) = rows.next()? {
+        result.push(row.get(0)?);
+    }
+    Ok(result)
+}
+
+
 /// Obtiene todos los IDs de code_state donde una columna específica tiene un valor específico
 /// 
 /// # Parámetros
