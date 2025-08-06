@@ -13,6 +13,7 @@ pub struct MetadataConfig {
     pub sketch_size: i32,
     pub click_size: i32,
     pub click_threshold: f64,
+    pub reference_size: i32
 }
 
 /// Estructura que encapsula la conexi�n a DuckDB.
@@ -171,7 +172,8 @@ impl DuckDb {
                 kmer_size INTEGER,
                 sketch_size INTEGER,
                 click_size INTEGER,
-                click_threshold DOUBLE
+                click_threshold DOUBLE,
+                reference_size INTEGER,
             );
         ";
         self.conn.execute_batch(schema_sql)?;
@@ -312,7 +314,7 @@ impl DuckDb {
     fn insert_metadata_from_config(&self, config: &MetadataConfig) -> Result<()> {
         let mut stmt = self.conn.prepare(
             "INSERT INTO metadata (
-                genus, acronym, levels, kmer_size, sketch_size, click_size, click_threshold
+                genus, acronym, levels, kmer_size, sketch_size, click_size, click_threshold, reference_size
             ) VALUES (?, ?, ?, ?, ?, ?, ?)"
         )?;
 
@@ -324,6 +326,7 @@ impl DuckDb {
             config.sketch_size,
             config.click_size,
             config.click_threshold,
+            config.reference_size
         ])?;
 
         Ok(())

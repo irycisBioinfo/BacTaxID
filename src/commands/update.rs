@@ -1,6 +1,6 @@
 use clap::Args;
 use anyhow::{Result, Context, anyhow, bail};
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::fs;
 use std::path::Path;
 use rayon::prelude::*;
@@ -211,7 +211,7 @@ pub fn update_command(args: &UpdateArgs) -> Result<()> {
 ///   inicializado a 0; se usará posteriormente para contar coincidencias por nivel.
 pub fn update_single_file(
     fasta_path: &Path,
-    ctx: &UpdateCtx,
+    ctx: &mut UpdateCtx,
     _sketch_manager: &SketchManager, // No se modifica, solo se pasa por consistencia
 ) -> Result<()> {
     // -------- 1. Validaciones --------
@@ -227,7 +227,9 @@ pub fn update_single_file(
     let sketch_size = ctx.sketch_size();
 
     let mut query_sketch = SketchManager::new(ctx.kmer_size(), ctx.sketch_size());
-    query_sketch.add_sketch_from_file(fasta_path)
+    let new_sketch = Sketch::new(fasta_path,ctx.kmer_size(),ctx.sketch_size());
+
+    query_sketch.add_sketch(new_sketch?)
     .with_context(|| format!("Error añadiendo sketch desde {:?}", fasta_path))?;
 
     // -------- 3. Extraer nombre de la muestra --------
@@ -239,7 +241,12 @@ pub fn update_single_file(
 
     // -------- 4. Crear el vector de clasificación --------
     let levels_len = ctx.levels_map.len();
-    let query_class = vec![0_u64; levels_len];
+    let mut query_class: HashMap<_, usize> = ctx.levels_map
+        .keys()  // Obtiene las claves
+        .map(|key| (key.clone(), 0_usize))  // Mapea cada clave a (clave, 0)
+        .collect();  // Recolecta en un HashMap
+
+
 
     println!(
         "✓ Sketch creado • muestra: {} • k: {} • sketch: {} • niveles: {}",
@@ -249,16 +256,61 @@ pub fn update_single_file(
         levels_len
     );
 
-    let reference_ids = get_ids_by_level_value(&ctx.conn, "L_0", "C")?;
-    let distances = pw_one_to_many(&query_sketch,&_sketch_manager,&reference_ids);
-    let best_hit = min_tuple_owned(&distances);
+    let mut ref_db: Vec<String> = Vec::new();
+    let mut distances: Vec<(String, String, f64)> = Vec::new();
+    let mut best_hit: Option<(String, String, f64)> = None;
 
-    //Ok((sample_name, query_sketch, query_class))
+    let levels_data: Vec<_> = ctx.levels_map.iter()
+    .map(|(k, v)| (k.clone(), v.clone()))
+    .collect();
+
+    for (level, Dist_level) in levels_data 
+    { 
+        if query_class.values().sum::<usize>() == 0 {
+            ref_db = get_ids_by_level_value(&ctx.conn, "L_0", "C")?;
+            
+        } else {
+            ref_db = find_matching_ids_by_levels_and_state(ctx.connection_mut(), &query_class, "C".to_string())?;
+        }
+        distances = pw_one_to_many(&query_sketch, &_sketch_manager, &ref_db);
+        best_hit = find_best_hit(&distances);
+        if let Some((sample, ref_name, dist)) = best_hit {
+            if dist <= Dist_level {
+                let value = get_level_value_by_id(ctx.connection_mut(), &ref_name, &level)?;
+                query_class.insert(level.clone(), value.unwrap_or(0) as usize);
+                // Aquí se actualizarían los contadores en query_class según corresponda
+            } else {
+                println!("No se encontró coincidencia cercana para {}", sample_name);
+            }
+        } else {
+            println!("No se encontraron coincidencias para {}", sample_name);
+        }
+        
+    }  
+
     Ok(())
 }
 
+pub fn get_level_value_by_id(
+    conn: &Connection,
+    id: &str,
+    level_column: &str,
+) -> Result<Option<usize>> {
+    let column_name = format!("L_{}", level_column);
+    let sql = format!("SELECT {} FROM code WHERE sample = ?", column_name);
+    
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([id])?;
+    
+    if let Some(row) = rows.next()? {
+        let value: Option<i64> = row.get(0)?;
+        Ok(value.map(|v| v as usize)) // Conversión directa
+    } else {
+        Ok(None)
+    }
+}
 
-pub fn min_tuple_owned(
+pub fn find_best_hit(
     data: &[(String, String, f64)],
 ) -> Option<(String, String, f64)> {
     data.iter()
@@ -275,24 +327,26 @@ pub fn min_tuple_owned(
 /// - `conn`: conexión DuckDB
 /// - `levels`: vector con valores de L_0..L_N (los 0 son comodín, no filtran)
 /// - `state_level`: índice del nivel para code_state (ej: 3 para L_3)
+
 pub fn find_matching_ids_by_levels_and_state(
     conn: &Connection,
-    levels: &[i64],
-    state_level: usize,
+    levels: &HashMap<String, usize>,  // <- Cambiado a HashMap
+    state_level: String,
 ) -> Result<Vec<String>> {
     // Construir condiciones sólo para los niveles != 0
     let mut conditions = Vec::new();
     let mut params: Vec<&dyn duckdb::ToSql> = Vec::new();
-    for (i, &val) in levels.iter().enumerate() {
-        if val != 0 {
-            let col = format!("L_{}", i);
+    
+    for (column_id, val) in levels.iter() {
+        if *val != 0 {
+            let col = format!("L_{}", column_id);  // <- Usar column_id directamente
             conditions.push(format!("code.{} = ?", col));
-            params.push(&val);
+            params.push(val);  // val es &usize, que implementa ToSql
         }
     }
 
     if conditions.is_empty() {
-        bail!("El vector de niveles no tiene ningún valor distinto de cero; no se puede construir consulta.");
+        bail!("El hashmap de niveles no tiene ningún valor distinto de cero; no se puede construir consulta.");
     }
 
     // Condición de estado (que code_state.L_x = 'C')
@@ -323,21 +377,31 @@ pub fn find_matching_ids_by_levels_and_state(
 /// pero solo se filtra por aquellas posiciones cuyo valor es distinto de 0.
 /// 
 /// - `conn`: conexión a DuckDB
-/// - `levels`: vector de valores para L_0..L_N
-pub fn find_matching_ids_by_levels(conn: &Connection, levels: &[i64]) -> Result<Vec<String>> {
-    // Construimos cláusulas dinámicas solo para los valores != 0
+/// - `levels`: hashmap de valores para L_0..L_N
+
+/// Busca los samples cuya columna dinámica L_x es distinta de cero.
+/// `levels_map` es un HashMap que mapea el sufijo de la columna (String) a su valor i64.
+/// Busca los samples cuya columna dinámica L_x es distinta de cero.
+pub fn find_matching_ids_by_levels(
+    conn: &Connection,
+    levels_map: &HashMap<String, i64>,
+) -> Result<Vec<String>> {
     let mut conditions = Vec::new();
     let mut params: Vec<&dyn duckdb::ToSql> = Vec::new();
-    for (i, &val) in levels.iter().enumerate() {
-        if val != 0 {
-            let col = format!("L_{}", i);
+
+    // Iterar sobre (&String, &i64)
+    for (column_id, val) in levels_map.iter() {
+        if *val != 0 {
+            let col = format!("L_{}", column_id);
             conditions.push(format!("{} = ?", col));
-            params.push(&val);
+            params.push(val);  // val: &i64 vive en levels_map
         }
     }
 
     if conditions.is_empty() {
-        bail!("El vector de niveles no tiene ningún valor distinto de cero; no se puede construir consulta.");
+        bail!(
+            "El HashMap de niveles no tiene ningún valor distinto de cero; no se puede construir consulta."
+        );
     }
 
     let where_clause = conditions.join(" AND ");

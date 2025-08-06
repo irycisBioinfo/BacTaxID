@@ -25,6 +25,7 @@ pub fn init_command(toml_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("  - Sketch size: {}", config.sketch_size);
     println!("  - Click size: {}", config.click_size);
     println!("  - Click threshold: {}", config.click_threshold);
+    println!("  - Reference Size:{}", config.reference_size);
     
     // 3. Crear la base de datos usando el acronym (no genus)
     let db_name = format!("{}.db", config.acronym);
