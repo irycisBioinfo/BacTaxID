@@ -99,20 +99,21 @@ pub fn exists_clique(
 }
 
 
-/// Elimina de la tabla 'edges' todas las filas cuyo ID esté en `edge_ids`.
+/// Elimina de la tabla 'edges' todas las filas cuyo ID esté en `edge_ids`
+/// y cuya distancia sea menor que `dist_max`.
 ///
 /// # Parámetros:
-/// - conn: Conexión DuckDB.
-/// - edge_ids: Slice de i64 con los IDs (primary key) a eliminar.
+/// - `conn`      : Conexión mutable a DuckDB.
+/// - `edge_ids`  : Slice de `i64` con los IDs (primary key) a eliminar.
+/// - `dist_max`  : Distancia máxima; solo se eliminan edges con `dist < dist_max`.
 ///
 /// # Retorna:
-/// - Ok(()) en caso de éxito, o Err en caso de error de base de datos.
-///
-/// # Nota:
-/// Si el vector está vacío, la función no hace nada.
-/// Elimina de la tabla 'edges' todas las filas cuyo ID esté en `edge_ids`.
-/// Elimina de la tabla 'edges' todas las filas cuyo ID esté en `edge_ids`.
-pub fn delete_edges_by_ids(conn: &mut Connection, edge_ids: &[i64]) -> Result<()> {
+/// - `Ok(())` en caso de éxito, o `Err` en caso de error de base de datos.
+pub fn delete_edges_by_ids(
+    conn: &mut Connection,
+    edge_ids: &[i64],
+    dist_max: f64,
+) -> Result<(), duckdb::Error> {
     if edge_ids.is_empty() {
         return Ok(());
     }
@@ -124,22 +125,31 @@ pub fn delete_edges_by_ids(conn: &mut Connection, edge_ids: &[i64]) -> Result<()
     tx.execute_batch(&format!("CREATE TEMP TABLE {} (id INTEGER)", temp_table))?;
     
     // Insertar IDs en la tabla temporal
-    let mut stmt = tx.prepare(&format!("INSERT INTO {} (id) VALUES (?)", temp_table))?;
+    let mut insert_stmt = tx.prepare(&format!("INSERT INTO {} (id) VALUES (?)", temp_table))?;
     for &id in edge_ids {
-        stmt.execute(params![id])?;
+        insert_stmt.execute(params![id])?;
     }
     
-    // Usar JOIN para eliminar en una sola operación
-    let deleted_count = tx.execute(&format!("DELETE FROM edges WHERE id IN (SELECT id FROM {})", temp_table), [])?;
+    // Eliminar solo aquellos edges con id en temp_table y dist < dist_max
+    let deleted = tx.execute(
+        &format!(
+            "DELETE FROM edges \
+             WHERE id IN (SELECT id FROM {}) \
+               AND dist < ?",
+            temp_table
+        ),
+        params![dist_max],
+    )?;
     
     // Limpiar tabla temporal
     tx.execute(&format!("DROP TABLE {}", temp_table), [])?;
     
     tx.commit()?;
     
-    println!("✓ Eliminadas {} filas de la tabla edges", deleted_count);
+    println!("✓ Eliminadas {} filas de la tabla edges", deleted);
     Ok(())
 }
+
 
 /// Obtiene los edges de `edges` donde source o target está en el slice de node_ids (ambos VARCHAR)
 /// y dist < dist_max. Retorna un vector de (source, target, dist).

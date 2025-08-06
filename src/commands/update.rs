@@ -4,12 +4,14 @@ use hashbrown::HashMap;
 use std::fs;
 use std::path::Path;
 use rayon::prelude::*;
-use duckdb::Connection;
+use duckdb::{Connection, Row, ToSql, params};
+use crate::graph::exists_clique;
 
 use crate::{
 
     sketch::sketching::*,
-    db::db::DuckDb
+    db::db::DuckDb,
+    graph::*,
 };
 
 /// Argumentos del subcomando update
@@ -36,8 +38,8 @@ pub struct UpdateArgs {
 pub struct UpdateCtx<'a> {
     /// Conexión mutable a DuckDB (re-utilizable en todas las fases)
     pub conn: &'a mut Connection,
-    /// Tabla levels (L_0 … L_N → dist)
-    pub levels_map: HashMap<String, f64>,
+    /// Tabla levels (L_0 … L_N → dist) como vector ordenado
+    pub levels: Vec<(String, f64)>,
     /// Toda la fila de metadata en forma (columna → valor en UTF-8)
     pub metadata_map: HashMap<String, String>,
 }
@@ -68,7 +70,7 @@ impl<'a> UpdateCtx<'a> {
         &self.metadata_map["acronym"]
     }
 
-    pub fn levels(&self) -> &str {
+    pub fn levels_str(&self) -> &str {
         &self.metadata_map["levels"]
     }
 
@@ -76,28 +78,41 @@ impl<'a> UpdateCtx<'a> {
     pub fn connection_mut(&mut self) -> &mut Connection {
         self.conn
     }
+
+    pub fn reference_size(&self) -> usize {
+        self.metadata_map["reference_size"].parse().unwrap_or(100)
+    }
+
+    /// Número de niveles
+    pub fn num_levels(&self) -> usize {
+        self.levels.len()
+    }
+
+    /// Obtener distancia para un nivel específico
+    pub fn get_level_distance(&self, level: &str) -> Option<f64> {
+        self.levels.iter().find(|(l, _)| l == level).map(|(_, d)| *d)
+    }
 }
 
-/// Lee la tabla `levels` y retorna un HashMap con los nombres de los niveles como clave
-/// y la distancia (dist, f64) como valor.
-fn load_levels_map(conn: &Connection) -> Result<HashMap<String, f64>> {
-    let mut stmt = conn.prepare("SELECT level, dist FROM levels")
+/// Lee la tabla `levels` y retorna un Vec<(String, f64)> ordenado por nivel
+fn load_levels_vec(conn: &Connection) -> Result<Vec<(String, f64)>> {
+    let mut stmt = conn.prepare("SELECT level, dist FROM levels ORDER BY dist ASC")
         .context("Error preparando consulta de tabla levels")?;
     
     let mut rows = stmt.query([])
         .context("Error ejecutando consulta de tabla levels")?;
     
-    let mut map = HashMap::new();
+    let mut levels = Vec::new();
     while let Some(row) = rows.next()? {
         let level: String = row.get(0)
             .context("Error obteniendo columna level")?;
         let dist: f64 = row.get(1)
             .context("Error obteniendo columna dist")?;
-        map.insert(level, dist);
+        levels.push((level, dist));
     }
     
-    println!("✓ Cargados {} niveles desde la tabla levels", map.len());
-    Ok(map)
+    println!("✓ Cargados {} niveles desde la tabla levels", levels.len());
+    Ok(levels)
 }
 
 /// Lee metadata (una sola fila) → HashMap<columna, valor_como_texto>
@@ -163,13 +178,13 @@ pub fn update_command(args: &UpdateArgs) -> Result<()> {
     println!("✓ Conexión a base de datos establecida");
 
     // Precargar tablas levels y metadata
-    let levels_map = load_levels_map(&conn)?;
+    let levels = load_levels_vec(&conn)?;
     let metadata_map = load_metadata_map(&conn)?;
 
     // Crear contexto compartido
     let mut ctx = UpdateCtx {
         conn: &mut conn,
-        levels_map,
+        levels,
         metadata_map,
     };
 
@@ -180,7 +195,7 @@ pub fn update_command(args: &UpdateArgs) -> Result<()> {
     println!("Sketch size: {}", ctx.sketch_size());
     println!("Click size: {}", ctx.click_size());
     println!("Click threshold: {}", ctx.click_threshold());
-    println!("Niveles disponibles: {}", ctx.levels_map.len());
+    println!("Niveles disponibles: {}", ctx.levels.len());
 
     // ✅ SOLUCIÓN: Extraer el valor del Result antes de usar
     let sketch_manager = SketchManager::load_from_disk(&args.sketch)
@@ -201,6 +216,46 @@ pub fn update_command(args: &UpdateArgs) -> Result<()> {
 }
 
 
+pub struct Query {
+    pub sample_name: String,
+    pub code: Vec<usize>,         // vector de enteros positivos
+    pub code_full: Vec<String>,   // vector de strings
+    pub code_state: Vec<String>,  // vector de strings
+    pub sketch: SketchManager,
+}
+
+impl Query {
+    /// Crea un nuevo Query cargando el SketchManager+Sketch, y vectores del tamaño adecuado
+    ///
+    /// # Arguments
+    /// * `path` - Path al archivo FASTA de entrada.
+    /// * `ctx` - Contexto que debe poder (por ejemplo) saber el número de niveles.
+    pub fn new(path: &Path, ctx: &UpdateCtx) -> anyhow::Result<Self> {
+        let sample_name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
+        let n_levels = ctx.levels.len();
+
+        // Vector de enteros positivos (inicializados a 0)
+        let code = vec![0_usize; n_levels];
+        // code_full inicializado con strings vacíos ("")
+        let code_full = vec!["".to_string(); n_levels];
+        // code_state inicializado con "S" (sin clasificar por defecto)
+        let code_state = vec!["S".to_string(); n_levels];
+        // Instanciar SketchManager y cargar Sketch
+        let mut sketch_manager = SketchManager::new(ctx.kmer_size(), ctx.sketch_size());
+        let sketch = Sketch::new(path, ctx.kmer_size(), ctx.sketch_size())?;
+        sketch_manager.add_sketch(sketch)?;
+
+        Ok(Query {
+            sample_name,
+            code,
+            code_full,
+            code_state,
+            sketch: sketch_manager,
+        })
+    }
+}
+
+
 /// Procesa **un** archivo FASTA:
 /// 1. Crea un `Sketch` de la muestra usando `Sketch::new` (que lee el FASTA internamente).
 /// 2. Crea el vector `query_class` con la longitud de los niveles.
@@ -212,317 +267,646 @@ pub fn update_command(args: &UpdateArgs) -> Result<()> {
 pub fn update_single_file(
     fasta_path: &Path,
     ctx: &mut UpdateCtx,
-    _sketch_manager: &SketchManager, // No se modifica, solo se pasa por consistencia
+    _sketch_manager: &SketchManager, // SketchManager de referencia
 ) -> Result<()> {
-    // -------- 1. Validaciones --------
-    if !fasta_path.exists() {
-        return Err(anyhow::anyhow!(
-            "Archivo FASTA no encontrado: {:?}",
-            fasta_path
-        ));
-    }
-
-    // -------- 2. Crear el Sketch desde el path --------
-    let kmer_size = ctx.kmer_size();
-    let sketch_size = ctx.sketch_size();
-
-    let mut query_sketch = SketchManager::new(ctx.kmer_size(), ctx.sketch_size());
-    let new_sketch = Sketch::new(fasta_path,ctx.kmer_size(),ctx.sketch_size());
-
-    query_sketch.add_sketch(new_sketch?)
-    .with_context(|| format!("Error añadiendo sketch desde {:?}", fasta_path))?;
-
-    // -------- 3. Extraer nombre de la muestra --------
-    let sample_name = fasta_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown")
-        .to_string();
-
-    // -------- 4. Crear el vector de clasificación --------
-    let levels_len = ctx.levels_map.len();
-    let mut query_class: HashMap<_, usize> = ctx.levels_map
-        .keys()  // Obtiene las claves
-        .map(|key| (key.clone(), 0_usize))  // Mapea cada clave a (clave, 0)
-        .collect();  // Recolecta en un HashMap
-
-
+    // -------- 1. Crear Query (incluye validaciones, sketch y vectores) --------
+    let mut query = Query::new(fasta_path, ctx)?;
 
     println!(
-        "✓ Sketch creado • muestra: {} • k: {} • sketch: {} • niveles: {}",
-        sample_name,
-        kmer_size,
-        sketch_size,
-        levels_len
+        "✓ Query creado • muestra: {} • k: {} • sketch: {} • niveles: {}",
+        query.sample_name,
+        ctx.kmer_size(),
+        ctx.sketch_size(),
+        ctx.num_levels()
     );
 
-    let mut ref_db: Vec<String> = Vec::new();
-    let mut distances: Vec<(String, String, f64)> = Vec::new();
-    let mut best_hit: Option<(String, String, f64)> = None;
+    // -------- 2. Variables para el procesamiento --------
 
-    let levels_data: Vec<_> = ctx.levels_map.iter()
-    .map(|(k, v)| (k.clone(), v.clone()))
-    .collect();
+    let mut ref_db: Vec<(String, usize, String, String)>; // (sample, code, code_full, code_state)
+    let mut distances: Vec<(String, String, f64)>; // (query_name, ref_name, distance)
+    let mut bh: Option<(String, usize, String, String)> = None;
+    let mut ref_ids: Vec<String> = Vec::new();
 
-    for (level, Dist_level) in levels_data 
-    { 
-        if query_class.values().sum::<usize>() == 0 {
-            ref_db = get_ids_by_level_value(&ctx.conn, "L_0", "C")?;
-            
+    let click_threshold = ctx.click_threshold();
+    let click_size = ctx.click_size();
+    let reference_size = ctx.reference_size();
+
+    // -------- 3. Procesar cada nivel en orden ascendente de distancia --------
+    for i in 0..ctx.levels.len() {
+        ref_db = if i == 0 {
+            retrive_classifiers(
+                ctx.connection_mut(),
+                i,
+                "" // Nivel 0 no tiene grupo, se ignora (puede ser cualquier string)
+            )?
         } else {
-            ref_db = find_matching_ids_by_levels_and_state(ctx.connection_mut(), &query_class, "C".to_string())?;
-        }
-        distances = pw_one_to_many(&query_sketch, &_sketch_manager, &ref_db);
-        best_hit = find_best_hit(&distances);
-        if let Some((sample, ref_name, dist)) = best_hit {
-            if dist <= Dist_level {
-                let value = get_level_value_by_id(ctx.connection_mut(), &ref_name, &level)?;
-                query_class.insert(level.clone(), value.unwrap_or(0) as usize);
-                // Aquí se actualizarían los contadores en query_class según corresponda
-            } else {
-                println!("No se encontró coincidencia cercana para {}", sample_name);
-            }
-        } else {
-            println!("No se encontraron coincidencias para {}", sample_name);
-        }
+            retrive_classifiers(
+                ctx.connection_mut(),
+                i,
+                &query.code_full[i - 1] // Usar el grupo del nivel anterior
+            )?
+        };
         
-    }  
+        // Extraer solo los sample names del resultado de retrive_classifiers
+        ref_ids = ref_db.iter().map(|(sample, _, _, _)| sample.clone()).collect();
+
+        distances = pw_one_to_many(
+            &query.sketch,
+            _sketch_manager,
+            &ref_ids,
+            ctx.levels[i].1  // Acceder al valor f64 de distancia del nivel i
+        );
+        
+        if distances.len() > 0 { //Existe al menos una distancia válida
+            // 4. Buscar el mejor hit (best hit) entre las distancias
+            bh = best_hit(&distances, &ref_db);
+            
+            // 5. Actualizar los vectores de código y estado según el mejor hit
+           bh = best_hit(&distances, &ref_db);
+           query.code[i] = bh.as_ref().map_or(0, |(_, code, _, _)| *code);
+           query.code_full[i] = bh.as_ref().map_or("".to_string(), |(_, _, code_full, _)| code_full.clone());
+           
+            if is_classifier(
+                &distances,
+                bh.as_ref().unwrap(),
+                &ref_db,
+                click_threshold,
+                reference_size
+            ) {
+                query.code_state[i] = "C".to_string(); // Clasificador
+            } // Si no es clasificador, se queda en "S" (satellite) que es el valor de inicialización por defecto
+        }else{ //No hay candidatos validos entre los clasificadores. BUscar nuevos cliques y crear nuevos grupos
+            if i == 0 {
+                ref_db = retrive_level(
+                    ctx.connection_mut(),
+                    i,
+                    "0" // Nivel 0 no tiene grupo, se ignora
+                )?;
+            } else {
+                ref_db = retrive_level(
+                    ctx.connection_mut(),
+                    i,
+                    &query.code_full[i - 1] // Usar el grupo del nivel anterior
+                )?;
+            }
+            ref_ids = ref_db.iter().map(|(sample, _, _, _)| sample.clone()).collect();
+
+            distances = pw_one_to_many(
+                &query.sketch,
+                _sketch_manager,
+                &ref_ids,
+                ctx.levels[i].1  // Acceder al valor f64 de distancia del nivel i
+            );
+            if distances.len() > 0{
+                //look_for_clique();
+                
+            }
+        } 
+        //update_dbs
+        //update_sketch_manager
+
+    }
+
+    println!(
+        "✓ Procesamiento completo • muestra: {} • código final: {:?}",
+        query.sample_name, query.code
+    );
+
+    Ok(())
+}   
+
+
+/// Recupera clasificadores que cumplen condiciones específicas de nivel y grupo.
+/// 
+/// # Argumentos
+/// * `conn` - Conexión a la base de datos DuckDB
+/// * `level` - Nivel taxonómico (0, 1, 2, 3, 4...)
+/// * `group` - Grupo taxonómico a filtrar (ignorado si level == 0)
+/// 
+/// # Retorna
+/// Vector de tuplas (sample, code, code_full, code_state) donde:
+/// - code_state.L_{level} == "C" 
+/// - code_full.L_{level} == group (excepto si level == 0)
+/// 
+/// # Ejemplo
+/// ```
+/// // Obtener todos los clasificadores de nivel 0 (ignora group)
+/// let results = retrive_classifiers(conn, 0, "0")?;
+/// 
+/// // Obtener clasificadores de nivel 2 del grupo "Escherichia"
+/// let results = retrive_classifiers(conn, 2, "1.1")?;
+/// ```
+pub fn retrive_classifiers(
+    conn: &Connection,
+    level: usize,
+    group: &str,
+) -> Result<Vec<(String, usize, String, String)>, duckdb::Error> {
+    
+    let level_col = format!("L_{}", level);
+    
+    let (sql, params): (String, Vec<&dyn duckdb::ToSql>) = if level == 0 {
+        // Si level == 0, ignora el group, solo filtra por code_state
+        (
+            format!(
+                "SELECT 
+                    c.sample,
+                    c.{level_col} as code,
+                    cf.{level_col} as code_full,
+                    cs.{level_col} as code_state
+                FROM code c
+                JOIN code_full cf ON c.sample = cf.sample  
+                JOIN code_state cs ON c.sample = cs.sample
+                WHERE cs.{level_col} = 'C'"
+            ),
+            Vec::new()
+        )
+    } else {
+        // Si level > 0, filtra por code_state = 'C' Y code_full = group
+        (
+            format!(
+                "SELECT 
+                    c.sample,
+                    c.{level_col} as code,
+                    cf.{level_col} as code_full,
+                    cs.{level_col} as code_state
+                FROM code c
+                JOIN code_full cf ON c.sample = cf.sample  
+                JOIN code_state cs ON c.sample = cs.sample
+                WHERE cs.{level_col} = 'C' 
+                AND cf.{level_col} = ?"
+            ),
+            vec![&group as &dyn duckdb::ToSql]
+        )
+    };
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params.as_slice())?;
+
+    let mut result = Vec::new();
+    while let Some(row) = rows.next()? {
+        let sample: String = row.get(0)?;
+        let code: usize = row.get(1)?;
+        let code_full: String = row.get(2)?;
+        let code_state: String = row.get(3)?;
+        
+        result.push((sample, code, code_full, code_state));
+    }
+
+    Ok(result)
+}
+
+/// Recupera todas las entradas de un nivel específico según criterios especiales.
+/// 
+/// # Argumentos
+/// * `conn` - Conexión a la base de datos DuckDB
+/// * `level` - Nivel taxonómico (0, 1, 2, 3, 4...)
+/// * `code_full_value` - Valor de code_full a filtrar (ignorado si level == 0)
+/// 
+/// # Retorna
+/// Vector de tuplas (sample, code, code_full, code_state) donde:
+/// - Si level == 0: code_state.L_0 == "C" OR code.L_0 == 0
+/// - Si level > 0: code_full.L_{level} == code_full_value
+/// 
+/// # Ejemplo
+/// ```
+/// // Obtener todas las entradas de nivel 0 (clasificadas o sin clasificar)
+/// let results = retrive_level(conn, 0, "ignored")?;
+/// 
+/// // Obtener todas las entradas de nivel 2 con code_full = "Escherichia"
+/// let results = retrive_level(conn, 2, "Escherichia")?;
+/// ```
+pub fn retrive_level(
+    conn: &Connection,
+    level: usize,
+    code_full_value: &str,
+) -> Result<Vec<(String, usize, String, String)>, duckdb::Error> {
+    
+    let level_col = format!("L_{}", level);
+    
+    let (sql, params): (String, Vec<&dyn duckdb::ToSql>) = if level == 0 {
+        // Si level == 0: code_state.L_0 == "C" OR code.L_0 == 0
+        (
+            format!(
+                "SELECT 
+                    c.sample,
+                    c.{level_col} as code,
+                    cf.{level_col} as code_full,
+                    cs.{level_col} as code_state
+                FROM code c
+                JOIN code_full cf ON c.sample = cf.sample  
+                JOIN code_state cs ON c.sample = cs.sample
+                WHERE cs.{level_col} = 'C' OR c.{level_col} = 0"
+            ),
+            Vec::new()
+        )
+    } else {
+        // Si level > 0: code_full.L_{level} == code_full_value
+        (
+            format!(
+                "SELECT 
+                    c.sample,
+                    c.{level_col} as code,
+                    cf.{level_col} as code_full,
+                    cs.{level_col} as code_state
+                FROM code c
+                JOIN code_full cf ON c.sample = cf.sample  
+                JOIN code_state cs ON c.sample = cs.sample
+                WHERE cf.{level_col} = ?"
+            ),
+            vec![&code_full_value as &dyn duckdb::ToSql]
+        )
+    };
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params.as_slice())?;
+
+    let mut result = Vec::new();
+    while let Some(row) = rows.next()? {
+        let sample: String = row.get(0)?;
+        let code: i32 = row.get(1)?;  // Obtener como i32 primero
+        let code_full: String = row.get(2)?;
+        let code_state: String = row.get(3)?;
+        
+        result.push((sample, code as usize, code_full, code_state));  // Convertir a usize
+    }
+
+    Ok(result)
+}
+
+
+/// Encuentra la distancia mínima y devuelve la tupla correspondiente de ref_db.
+/// 
+/// # Argumentos
+/// * `distances` - Vector de tuplas (query_name, ref_name, distance)
+/// * `ref_db` - Vector de tuplas (sample, code, code_full, code_state) de retrive_classifiers
+/// 
+/// # Retorna
+/// Option con la tupla de ref_db que tiene el sample correspondiente al mejor hit,
+/// o None si no se encuentra coincidencia o no hay distancias válidas.
+pub fn best_hit(
+    distances: &[(String, String, f64)],
+    ref_db: &[(String, usize, String, String)],
+) -> Option<(String, usize, String, String)> {
+    // 1. Encontrar la distancia mínima (ignorar NaN)
+    let best_distance = distances
+        .iter()
+        .filter(|(_, _, dist)| !dist.is_nan())  // Filtrar NaN
+        .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap())?;  // Comparar por distancia (índice 2)
+    
+    // 2. Obtener el ref_name del mejor hit
+    let best_ref_name = &best_distance.1;  // Segunda columna de distances
+    
+    // 3. Buscar la tupla correspondiente en ref_db
+    ref_db
+        .iter()
+        .find(|(sample, _, _, _)| sample == best_ref_name)  // Primera columna de ref_db
+        .cloned()  // Clonar para devolver la tupla completa
+}
+
+/// Determina si un best_hit pasa el criterio de clasificación.
+///
+/// # Argumentos
+/// * `distances`       - Vector de tuplas (query_name, ref_name, dist).
+/// * `best_hit`        - Tupla (sample, code, code_full, code_state) del mejor hit.
+/// * `ref_db`          - Vector de tuplas (sample, code, code_full, code_state).
+/// * `click_threshold` - Umbral mínimo de proporción (p.ej. 0.025).
+/// * `reference_size`  - Tamaño máximo permitido para el grupo; si se iguala o supera, falla.
+///
+/// # Retorna
+/// `true` si (count_dist / count_ref) >= click_threshold **y** count_ref < reference_size;
+/// `false` en caso contrario.
+pub fn is_classifier(
+    distances: &[(String, String, f64)],
+    best_hit: &(String, usize, String, String),
+    ref_db: &[(String, usize, String, String)],
+    click_threshold: f64,
+    reference_size: usize,
+) -> bool {
+    // Extraer el code_full del best_hit
+    let best_full = &best_hit.2;
+
+    // 1. Contar cuántas filas en ref_db tienen ese mismo code_full
+    let count_ref = ref_db
+        .iter()
+        .filter(|(_, _, code_full, _)| code_full == best_full)
+        .count();
+
+    // Si count_ref >= reference_size, devuelve false
+    if count_ref >= reference_size {
+        return false;
+    }
+
+    // 2. Contar en distances cuántas coincidencias apuntan a samples con ese code_full
+    let count_dist = distances
+        .iter()
+        .filter(|(_, target_sample, _)| {
+            ref_db
+                .iter()
+                .find(|(sample, _, code_full, _)| sample == target_sample && code_full == best_full)
+                .is_some()
+        })
+        .count();
+
+    // 3. Calcular proporción y comparar con threshold
+    if count_ref == 0 {
+        // Evitar división por cero; si no hay references, falla
+        return false;
+    }
+    let ratio = (count_dist as f64) / (count_ref as f64);
+    ratio >= click_threshold
+}
+/// Busca cliques en niveles taxonómicos específicos y actualiza el objeto Query.
+///
+/// # Argumentos
+/// * `conn` - Conexión mutable a DuckDB
+/// * `distances` - Vector de distancias (query_name, ref_name, distance) a insertar
+/// * `level` - Nivel inicial desde donde empezar la búsqueda (inclusive)
+/// * `ctx` - Contexto con información de niveles y parámetros
+/// * `query` - Objeto Query que será modificado con los resultados del clique
+///
+/// # Proceso
+/// 1. Inserta las distancias en la tabla edges
+/// 2. Busca cliques desde el nivel especificado hacia arriba
+/// 3. Si encuentra un clique, actualiza el Query y elimina edges
+///
+/// # Retorna
+/// Result con () en caso de éxito, o Error en caso de fallo
+pub fn look_for_cliques(
+    conn: &mut Connection,
+    distances: &[(String, String, f64)],
+    level: usize,
+    ctx: &UpdateCtx,
+    query: &mut Query,
+) -> Result<(), duckdb::Error> {
+    // 1. Insertar edges
+    let edges_to_insert: Vec<(String, String, f64)> = distances
+        .iter()
+        .map(|(q, r, d)| (q.clone(), r.clone(), *d))
+        .collect();
+    insert_edges(conn, &edges_to_insert)?;
+    println!("✓ Insertados {} edges", edges_to_insert.len());
+
+    // 2. IDs únicos
+    let mut unique_ids = hashbrown::HashSet::new();
+    for (q, r, _) in distances {
+        unique_ids.insert(q.clone());
+        unique_ids.insert(r.clone());
+    }
+    let node_ids: Vec<String> = unique_ids.into_iter().collect();
+
+    // 3. Bucle de niveles
+    for j in level..ctx.levels.len() {
+        let (_level_name, dist_threshold) = &ctx.levels[j];
+        let click_size = ctx.click_size();
+        println!(
+            "🔍 Nivel {} umbral {:.4} tamaño mínimo {}",
+            j, dist_threshold, click_size
+        );
+
+        if let Some((clique_nodes, clique_edges)) = exists_clique(
+            conn,
+            &node_ids,
+            *dist_threshold,
+            click_size,
+        )? {
+            println!(
+                "✅ Clique en nivel {} • nodos: {} • edges: {}",
+                j,
+                clique_nodes.len(),
+                clique_edges.len()
+            );
+
+            // 4. Actualizar código para el nivel j
+            set_clique_code_for_query(conn, query, j)?;
+            // 5. Propagar valores a nodos del clique
+            update_clique_samples(conn, &clique_nodes, j, query)?;
+            // 6. Propagar valores a nodos fuera del clique con estado "S"
+            update_non_clique_samples(conn, &node_ids, &clique_nodes, j, query)?;
+
+            // 7. Eliminar edges inválidos: solo aquellos del clique con dist < dist_threshold
+            if j == ctx.levels.len(){
+                let dist_threshold = 1.0;
+            }else{
+                let dist_threshold = ctx.levels[j+1].1;
+            }
+            
+            delete_edges_by_ids(conn, &clique_edges, *dist_threshold)?;
+            println!(
+                "🗑️ Eliminados {} edges no válidos (dist < {:.4})",
+                clique_edges.len(),
+                dist_threshold
+            );
+
+            return Ok(());
+        } else {
+            println!("○ No hay clique en nivel {}", j);
+        }
+    }
+
+    println!("○ Sin cliques desde nivel {}", level);
+    Ok(())
+}
+
+
+
+
+/// Actualiza el campo code, code_full y code_state de `query` en el nivel `level`
+/// basándose en datos de la tabla `code`.
+///
+/// - Si `level == 0`, obtiene el máximo `code.L_0` de la tabla `code`.
+/// - Si `level > 0`, obtiene el máximo `code.L_{level}`
+///   para filas cuyo `code_full.L_{level-1}` coincida con `query.code_full[level-1]`.
+/// - Asigna `query.code[level]` y `query.code_full[level]` directamente.
+/// - Marca `query.code_state[level] = "C"`.
+pub fn set_clique_code_for_query(
+    conn: &mut Connection,
+    query: &mut Query,
+    level: usize,
+) -> Result<(), duckdb::Error> {
+    let level_col = format!("L_{}", level);
+
+    // 1. Obtener el valor máximo de code desde la tabla `code`
+    let max_code_opt: Option<i64> = if level == 0 {
+        conn.query_row(
+            &format!("SELECT MAX({}) FROM code", level_col),
+            [],
+            |r| r.get(0),
+        )?
+    } else {
+        let prev_col = format!("L_{}", level - 1);
+        let prev_full = &query.code_full[level - 1];
+        conn.query_row(
+            &format!(
+                "SELECT MAX(c.{level_col}) \
+                 FROM code c \
+                 JOIN code_full cf ON c.sample = cf.sample \
+                 WHERE cf.{prev_col} = ?"
+            ),
+            params![prev_full],
+            |r| r.get(0),
+        )?
+    };
+
+    // 2. Asignar code = max_code + 1 (o 1 si no hay resultado) y estado
+    let code_value = max_code_opt.unwrap_or(0) as usize + 1;
+    query.code[level] = code_value;
+    query.code_state[level] = "C".to_string();
+
+    // 3. Construir code_full inline
+    if level == 0 {
+        query.code_full[0] = code_value.to_string();
+    } else if code_value == 0 {
+        // Nunca sucede porque code_value >= 1
+        query.code_full[level].clear();
+    } else {
+        let prev_full = &query.code_full[level - 1];
+        if prev_full.is_empty() {
+            query.code_full[level].clear();
+        } else {
+            query.code_full[level] = format!("{}.{}", prev_full, code_value);
+        }
+    }
+
+    println!(
+        "📝 Query nivel {} actualizado • Code: {} • Full: '{}' • State: C",
+        level, query.code[level], query.code_full[level]
+    );
 
     Ok(())
 }
 
-pub fn get_level_value_by_id(
-    conn: &Connection,
-    id: &str,
-    level_column: &str,
-) -> Result<Option<usize>> {
-    let column_name = format!("L_{}", level_column);
-    let sql = format!("SELECT {} FROM code WHERE sample = ?", column_name);
-    
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query([id])?;
-    
-    if let Some(row) = rows.next()? {
-        let value: Option<i64> = row.get(0)?;
-        Ok(value.map(|v| v as usize)) // Conversión directa
-    } else {
-        Ok(None)
-    }
-}
-
-pub fn find_best_hit(
-    data: &[(String, String, f64)],
-) -> Option<(String, String, f64)> {
-    data.iter()
-        .filter(|t| !t.2.is_nan())                      // descartar NaN
-        .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap())  // comparar f64
-        .cloned()                                      // ← mueve (clona) toda la tupla
-}
-
-
-/// Devuelve los IDs (sample) de filas de `code` que coinciden con el vector de entrada
-/// en las columnas L_0..L_N (solo valores != 0), y que 
-/// en `code_state` tienen "C" en la columna L_{state_level}.
+/// Propaga los valores de `query` en el nivel `level` a todos los `samples` del clique,
+/// actualizando e insertando en las tablas `code`, `code_full` y `code_state`.
 ///
-/// - `conn`: conexión DuckDB
-/// - `levels`: vector con valores de L_0..L_N (los 0 son comodín, no filtran)
-/// - `state_level`: índice del nivel para code_state (ej: 3 para L_3)
+/// # Argumentos
+/// * `conn`         – Conexión mutable a DuckDB.
+/// * `clique_nodes` – Slice de IDs de muestras a actualizar.
+/// * `level`        – Nivel de taxonomía (ej. 0,1,2…).
+/// * `query`        – Objeto Query con los valores ya asignados para ese nivel.
+///
+/// # Retorna
+/// Result<(), duckdb::Error>
+pub fn update_clique_samples(
+    conn: &mut Connection,
+    clique_nodes: &[String],
+    level: usize,
+    query: &Query,
+) -> Result<(), duckdb::Error> {
+    let code_val = query.code[level] as i64;
+    let full_val = &query.code_full[level];
+    let state_val = &query.code_state[level];
+    let level_col   = format!("L_{}", level);
 
-pub fn find_matching_ids_by_levels_and_state(
-    conn: &Connection,
-    levels: &HashMap<String, usize>,  // <- Cambiado a HashMap
-    state_level: String,
-) -> Result<Vec<String>> {
-    // Construir condiciones sólo para los niveles != 0
-    let mut conditions = Vec::new();
-    let mut params: Vec<&dyn duckdb::ToSql> = Vec::new();
-    
-    for (column_id, val) in levels.iter() {
-        if *val != 0 {
-            let col = format!("L_{}", column_id);  // <- Usar column_id directamente
-            conditions.push(format!("code.{} = ?", col));
-            params.push(val);  // val es &usize, que implementa ToSql
-        }
+    for sample in clique_nodes {
+        // UPDATE existentes
+        conn.execute(
+            &format!("UPDATE code SET {} = ? WHERE sample = ?", level_col),
+            params![code_val, sample],
+        )?;
+        conn.execute(
+            &format!("UPDATE code_full SET {} = ? WHERE sample = ?", level_col),
+            params![full_val, sample],
+        )?;
+        conn.execute(
+            &format!("UPDATE code_state SET {} = ? WHERE sample = ?", level_col),
+            params![state_val, sample],
+        )?;
+
+        // INSERT si no existen
+        conn.execute(
+            &format!(
+                "INSERT INTO code (sample, {}) \
+                 SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM code WHERE sample = ?)",
+                level_col
+            ),
+            params![sample, code_val, sample],
+        )?;
+        conn.execute(
+            &format!(
+                "INSERT INTO code_full (sample, {}) \
+                 SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM code_full WHERE sample = ?)",
+                level_col
+            ),
+            params![sample, full_val, sample],
+        )?;
+        conn.execute(
+            &format!(
+                "INSERT INTO code_state (sample, {}) \
+                 SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM code_state WHERE sample = ?)",
+                level_col
+            ),
+            params![sample, state_val, sample],
+        )?;
     }
 
-    if conditions.is_empty() {
-        bail!("El hashmap de niveles no tiene ningún valor distinto de cero; no se puede construir consulta.");
-    }
-
-    // Condición de estado (que code_state.L_x = 'C')
-    let state_col = format!("L_{}", state_level);
-    conditions.push(format!("cs.{} = 'C'", state_col));
-
-    let where_clause = conditions.join(" AND ");
-    let sql = format!(
-        "SELECT code.sample \
-         FROM code \
-         JOIN code_state cs ON code.sample = cs.sample \
-         WHERE {}",
-        where_clause
-    );
-
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query(params.as_slice())?;
-
-    let mut result = Vec::new();
-    while let Some(row) = rows.next()? {
-        result.push(row.get(0)?);
-    }
-    Ok(result)
+    Ok(())
 }
 
-/// Devuelve los IDs (sample) de las filas de la tabla 'code'
-/// que coinciden con el vector de entrada en las columnas L_0, L_1, ..., L_N,
-/// pero solo se filtra por aquellas posiciones cuyo valor es distinto de 0.
-/// 
-/// - `conn`: conexión a DuckDB
-/// - `levels`: hashmap de valores para L_0..L_N
+/// Propaga los valores de `query` en el nivel `level` a los nodos NO pertenecientes al clique,
+/// actualizando e insertando en las tablas `code`, `code_full` y `code_state` con estado "S".
+///
+/// # Argumentos
+/// * `conn`       – Conexión mutable a DuckDB.
+/// * `all_nodes`  – Slice de todos los IDs de muestras consideradas.
+/// * `clique_nodes` – Slice de IDs de muestras que forman el clique.
+/// * `level`      – Nivel de taxonomía (ej. 0,1,2…).
+/// * `query`      – Objeto Query con los valores ya asignados para ese nivel.
+///
+/// # Retorna
+/// Result<(), duckdb::Error>
+pub fn update_non_clique_samples(
+    conn: &mut Connection,
+    all_nodes: &[String],
+    clique_nodes: &[String],
+    level: usize,
+    query: &Query,
+) -> Result<(), duckdb::Error> {
+    let code_val = query.code[level] as i64;
+    let full_val = &query.code_full[level];
+    let state_val = "S";
+    let level_col   = format!("L_{}", level);
 
-/// Busca los samples cuya columna dinámica L_x es distinta de cero.
-/// `levels_map` es un HashMap que mapea el sufijo de la columna (String) a su valor i64.
-/// Busca los samples cuya columna dinámica L_x es distinta de cero.
-pub fn find_matching_ids_by_levels(
-    conn: &Connection,
-    levels_map: &HashMap<String, i64>,
-) -> Result<Vec<String>> {
-    let mut conditions = Vec::new();
-    let mut params: Vec<&dyn duckdb::ToSql> = Vec::new();
+    for sample in all_nodes.iter().filter(|s| !clique_nodes.contains(s)) {
+        // UPDATE existentes
+        conn.execute(
+            &format!("UPDATE code SET {} = ? WHERE sample = ?", level_col),
+            params![code_val, sample],
+        )?;
+        conn.execute(
+            &format!("UPDATE code_full SET {} = ? WHERE sample = ?", level_col),
+            params![full_val, sample],
+        )?;
+        conn.execute(
+            &format!("UPDATE code_state SET {} = ? WHERE sample = ?", level_col),
+            params![state_val, sample],
+        )?;
 
-    // Iterar sobre (&String, &i64)
-    for (column_id, val) in levels_map.iter() {
-        if *val != 0 {
-            let col = format!("L_{}", column_id);
-            conditions.push(format!("{} = ?", col));
-            params.push(val);  // val: &i64 vive en levels_map
-        }
+        // INSERT si no existen
+        conn.execute(
+            &format!(
+                "INSERT INTO code (sample, {}) \
+                 SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM code WHERE sample = ?)",
+                level_col
+            ),
+            params![sample, code_val, sample],
+        )?;
+        conn.execute(
+            &format!(
+                "INSERT INTO code_full (sample, {}) \
+                 SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM code_full WHERE sample = ?)",
+                level_col
+            ),
+            params![sample, full_val, sample],
+        )?;
+        conn.execute(
+            &format!(
+                "INSERT INTO code_state (sample, {}) \
+                 SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM code_state WHERE sample = ?)",
+                level_col
+            ),
+            params![sample, state_val, sample],
+        )?;
     }
 
-    if conditions.is_empty() {
-        bail!(
-            "El HashMap de niveles no tiene ningún valor distinto de cero; no se puede construir consulta."
-        );
-    }
-
-    let where_clause = conditions.join(" AND ");
-    let sql = format!("SELECT sample FROM code WHERE {}", where_clause);
-
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query(params.as_slice())?;
-
-    let mut result = Vec::new();
-    while let Some(row) = rows.next()? {
-        result.push(row.get(0)?);
-    }
-    Ok(result)
-}
-
-
-/// Obtiene todos los IDs de code_state donde una columna específica tiene un valor específico
-/// 
-/// # Parámetros
-/// * `conn` - Conexión a DuckDB
-/// * `level` - Nombre de la columna de nivel (ej: "L_0", "L_1", etc.)
-/// * `value` - Valor a buscar (ej: "C", "G", etc.)
-pub fn get_ids_by_level_value(
-    conn: &Connection, 
-    level: &str, 
-    value: &str
-) -> Result<Vec<String>> {
-    // Validar que el nivel existe
-    let column_check = "SELECT column_name FROM information_schema.columns 
-                       WHERE table_name = 'code_state' AND column_name = ?";
-    
-    let mut check_stmt = conn.prepare(column_check)?;
-    let mut check_rows = check_stmt.query([level])?;
-    
-    if check_rows.next()?.is_none() {
-        bail!("La columna {} no existe en la tabla code_state", level);
-        // o, equivalente:
-        // return Err(anyhow!("La columna {} no existe en la tabla code_state", level));
-    }
-
-
-    // Construir consulta dinámica (cuidado con SQL injection)
-    let sql = format!("SELECT sample FROM code_state WHERE {} = ?", level);
-    
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query([value])?;
-    
-    let mut ids = Vec::new();
-    while let Some(row) = rows.next()? {
-        let sample_id: String = row.get(0)?;
-        ids.push(sample_id);
-    }
-    
-    println!("✓ Encontrados {} IDs con {} = '{}'", ids.len(), level, value);
-    Ok(ids)
-}
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
-
-    #[test]
-    fn test_load_levels_map() {
-        let conn = Connection::open(":memory:").unwrap();
-        
-        // Crear tabla levels de prueba
-        conn.execute_batch("CREATE TABLE levels (level VARCHAR, dist DOUBLE)").unwrap();
-        conn.execute_batch("INSERT INTO levels VALUES ('L_0', 95000.0), ('L_1', 98000.0), ('L_2', 99000.0)").unwrap();
-        
-        let result = load_levels_map(&conn).unwrap();
-        
-        assert_eq!(result.len(), 3);
-        assert_eq!(result["L_0"], 95000.0);
-        assert_eq!(result["L_1"], 98000.0);
-        assert_eq!(result["L_2"], 99000.0);
-    }
-
-    #[test]
-    fn test_load_metadata_map() {
-        let conn = Connection::open(":memory:").unwrap();
-        
-        // Crear tabla metadata de prueba
-        conn.execute_batch(
-            "CREATE TABLE metadata (genus VARCHAR, acronym VARCHAR, kmer_size INTEGER, sketch_size INTEGER)"
-        ).unwrap();
-        conn.execute_batch(
-            "INSERT INTO metadata VALUES ('Escherichia', 'EC', 21, 1000)"
-        ).unwrap();
-        
-        let result = load_metadata_map(&conn).unwrap();
-        
-        assert_eq!(result.len(), 4);
-        assert_eq!(result["genus"], "Escherichia");
-        assert_eq!(result["acronym"], "EC");
-        assert_eq!(result["kmer_size"], "21");
-        assert_eq!(result["sketch_size"], "1000");
-    }
-
-    #[test]
-    fn test_update_ctx_getters() {
-        let mut conn = Connection::open(":memory:").unwrap();
-        
-        let mut metadata_map = HashMap::new();
-        metadata_map.insert("kmer_size".to_string(), "25".to_string());
-        metadata_map.insert("sketch_size".to_string(), "2000".to_string());
-        metadata_map.insert("click_size".to_string(), "75".to_string());
-        metadata_map.insert("click_threshold".to_string(), "0.05".to_string());
-        
-        let ctx = UpdateCtx {
-            conn: &mut conn,
-            levels_map: HashMap::new(),
-            metadata_map,
-        };
-        
-        assert_eq!(ctx.kmer_size(), 25);
-        assert_eq!(ctx.sketch_size(), 2000);
-        assert_eq!(ctx.click_size(), 75);
-        assert!((ctx.click_threshold() - 0.05).abs() < f64::EPSILON);
-    }
+    Ok(())
 }

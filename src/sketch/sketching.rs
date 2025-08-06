@@ -254,49 +254,60 @@ pub fn jaccard_index(sketch1: &[u64], sketch2: &[u64], kmer_size: usize) -> f64 
     // Distancia Mash: D = -1/k * ln(2j/(1+j))
     -((2. * jaccard_value) / (1. + jaccard_value)).ln() / kmer_size as f64
 }
-
-/// Compara todos los sketches en `query_manager` contra un subconjunto de sketches en `reference_manager`
-/// de forma paralela, devolviendo un vector de tripletes (Source, Target, Distancia).
+/// Compara los sketches de query_manager contra un subconjunto específico de sketches 
+/// en reference_manager, devolviendo solo aquellas comparaciones con distancia < max_dist.
 ///
 /// # Argumentos
-/// - `query_manager`: Referencia al SketchManager que contiene los sketches fuente (query).
-/// - `reference_manager`: Referencia al SketchManager que contiene los sketches de referencia (target).
-/// - `subset_ids`: Vector de IDs (nombres) para filtrar el subconjunto en reference_manager.
+/// - `query_manager`: SketchManager con los sketches fuente (query).
+/// - `reference_manager`: SketchManager con los sketches de referencia.
+/// - `subset_ids`: Lista de IDs específicos para comparar del reference_manager.
+/// - `max_dist`: Distancia máxima. Solo se retornan distancias < max_dist.
 ///
 /// # Retorna
-/// Un vector de tuplas (nombre_source, nombre_target, distancia).
+/// Vector de tuplas (nombre_query, nombre_referencia, distancia) donde distancia < max_dist.
 pub fn pw_one_to_many(
     query_manager: &SketchManager,
     reference_manager: &SketchManager,
     subset_ids: &[String],
+    max_dist: f64,
 ) -> Vec<(String, String, f64)> {
     query_manager.sketches.par_iter().flat_map(|(source_name, source_sketch)| {
         subset_ids.par_iter().filter_map(move |target_id| {
-            reference_manager.get_sketch(target_id).map(|target_sketch| {
+            reference_manager.get_sketch(target_id).and_then(|target_sketch| {
                 let dist = source_sketch.distance(target_sketch);
-                (source_name.clone(), target_id.clone(), dist)
+                if dist < max_dist {
+                    Some((source_name.clone(), target_id.clone(), dist))
+                } else {
+                    None
+                }
             })
         }).collect::<Vec<_>>()
     }).collect()
 }
 
 /// Compara todos los sketches en `query_manager` contra todos los sketches en `reference_manager`
-/// de forma paralela, devolviendo un vector de tripletes (Source, Target, Distancia).
+/// de forma paralela, devolviendo solo aquellas comparaciones con distancia < max_dist.
 ///
 /// # Argumentos
 /// - `query_manager`: Referencia al SketchManager que contiene los sketches fuente (query).
 /// - `reference_manager`: Referencia al SketchManager que contiene los sketches de referencia (target).
+/// - `max_dist`: Distancia máxima. Solo se retornan distancias < max_dist.
 ///
 /// # Retorna
-/// Un vector de tuplas (nombre_source, nombre_target, distancia).
+/// Un vector de tuplas (nombre_source, nombre_target, distancia) donde distancia < max_dist.
 pub fn pw_one_to_all(
     query_manager: &SketchManager,
     reference_manager: &SketchManager,
+    max_dist: f64,
 ) -> Vec<(String, String, f64)> {
     query_manager.sketches.par_iter().flat_map(|(source_name, source_sketch)| {
-        reference_manager.sketches.par_iter().map(move |(target_name, target_sketch)| {
+        reference_manager.sketches.par_iter().filter_map(move |(target_name, target_sketch)| {
             let dist = source_sketch.distance(target_sketch);
-            (source_name.clone(), target_name.clone(), dist)
+            if dist < max_dist {
+                Some((source_name.clone(), target_name.clone(), dist))
+            } else {
+                None
+            }
         })
     }).collect()
 }
