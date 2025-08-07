@@ -4,7 +4,7 @@ use hashbrown::HashMap;
 use std::fs;
 use std::path::Path;
 use rayon::prelude::*;
-use duckdb::{Connection, Row, ToSql, params};
+use duckdb::{Connection, Row, ToSql, params,Result as DuckResult};
 use crate::graph::exists_clique;
 
 use crate::{
@@ -358,11 +358,27 @@ pub fn update_single_file(
                 ctx.levels[i].1  // Acceder al valor f64 de distancia del nivel i
             );
             if distances.len() > 0{
-                //look_for_clique();
+               // Ahora extraes los valores necesarios de ctx ANTES de llamar a look_for_cliques:
+                let levels = ctx.levels.clone(); // Clonar los niveles para pasarlos a la función
+                let click_size = ctx.click_size();
+                let conn = ctx.connection_mut();  // Préstamo mutable al final
+
+                // Y luego llamas a la función:
+                look_for_cliques(
+                    conn,
+                    &distances,
+                    i,
+                    &levels,
+                    click_size,
+                    &mut query,
+                )?;
                 
             }
         } 
-        //update_dbs
+        update_duckdb(
+            ctx.connection_mut(),
+            &query
+        )?;
         //update_sketch_manager
 
     }
@@ -635,7 +651,8 @@ pub fn look_for_cliques(
     conn: &mut Connection,
     distances: &[(String, String, f64)],
     level: usize,
-    ctx: &UpdateCtx,
+    levels: &[(String, f64)],
+    click_size: usize,
     query: &mut Query,
 ) -> Result<(), duckdb::Error> {
     // 1. Insertar edges
@@ -655,9 +672,9 @@ pub fn look_for_cliques(
     let node_ids: Vec<String> = unique_ids.into_iter().collect();
 
     // 3. Bucle de niveles
-    for j in level..ctx.levels.len() {
-        let (_level_name, dist_threshold) = &ctx.levels[j];
-        let click_size = ctx.click_size();
+    for j in level..levels.len() {
+        let (_level_name, dist_threshold) = &levels[j];
+        
         println!(
             "🔍 Nivel {} umbral {:.4} tamaño mínimo {}",
             j, dist_threshold, click_size
@@ -684,22 +701,24 @@ pub fn look_for_cliques(
             update_non_clique_samples(conn, &node_ids, &clique_nodes, j, query)?;
 
             // 7. Eliminar edges inválidos: solo aquellos del clique con dist < dist_threshold
-            if j == ctx.levels.len(){
-                let dist_threshold = 1.0;
-            }else{
-                let dist_threshold = ctx.levels[j+1].1;
-            }
+            let delete_dist_threshold = if j == levels.len() - 1 {
+                // Si es el último nivel, usar el threshold del siguiente nivel (que no existe)
+                1.0 // Valor arbitrario alto para eliminar todos los edges
+            } else {
+                levels[j + 1].1 // Umbral del siguiente nivel
+            };
             
-            delete_edges_by_ids(conn, &clique_edges, *dist_threshold)?;
+            delete_edges_by_ids(conn, &clique_edges, delete_dist_threshold)?;
             println!(
                 "🗑️ Eliminados {} edges no válidos (dist < {:.4})",
                 clique_edges.len(),
-                dist_threshold
+                delete_dist_threshold
             );
 
             return Ok(());
         } else {
             println!("○ No hay clique en nivel {}", j);
+            break; // No hay clique, salir del bucle
         }
     }
 
@@ -905,6 +924,58 @@ pub fn update_non_clique_samples(
                 level_col
             ),
             params![sample, state_val, sample],
+        )?;
+    }
+
+    Ok(())
+}
+
+
+
+/// Guarda todos los valores de query (code, code_full, code_state)
+/// en las tablas code, code_full y code_state de DuckDB para el sample actual.
+///
+/// Requiere que Query tenga los campos:
+/// - sample_name: String
+/// - code: Vec<usize>
+/// - code_full: Vec<String>
+/// - code_state: Vec<String>
+pub fn update_duckdb(
+    conn: &mut Connection,
+    query: &Query,
+) -> DuckResult<()> {
+    // Asume que los vectores code, code_full y code_state tienen igual longitud
+    let sample = &query.sample_name;
+    let n = query.code.len();
+
+    for i in 0..n {
+        let col = format!("L_{}", i);
+
+        // GUARDAR EN TABLA "code"
+        conn.execute(
+            &format!(
+                "INSERT INTO code (sample, {col}) VALUES (?, ?) \
+                 ON CONFLICT(sample) DO UPDATE SET {col} = excluded.{col}"
+            ),
+            params![sample, query.code[i] as i64], // DuckDB espera i64 para enteros
+        )?;
+
+        // GUARDAR EN TABLA "code_full"
+        conn.execute(
+            &format!(
+                "INSERT INTO code_full (sample, {col}) VALUES (?, ?) \
+                 ON CONFLICT(sample) DO UPDATE SET {col} = excluded.{col}"
+            ),
+            params![sample, &query.code_full[i]],
+        )?;
+
+        // GUARDAR EN TABLA "code_state"
+        conn.execute(
+            &format!(
+                "INSERT INTO code_state (sample, {col}) VALUES (?, ?) \
+                 ON CONFLICT(sample) DO UPDATE SET {col} = excluded.{col}"
+            ),
+            params![sample, &query.code_state[i]],
         )?;
     }
 
