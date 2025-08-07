@@ -1,12 +1,14 @@
 use clap::{Parser, Subcommand};
 use std::process;
+use anyhow::{Context, Result};
 
 mod db;
 mod sketch;
 mod graph;
 mod commands;
 
-use commands::{init_command, verify_init_files, update_command};
+use commands::{init_command, update_command, verify_init_files};
+use commands::update::UpdateArgs;
 
 #[derive(Parser)]
 #[command(name = "bactaxid")]
@@ -21,66 +23,45 @@ struct Cli {
 enum Commands {
     /// Inicializa una nueva base de datos y SketchManager desde un archivo TOML
     Init {
-        /// Ruta al archivo TOML de configuración
         #[arg(value_name = "TOML_FILE")]
         toml_file: String,
-        
+
         /// Verificar la integridad de los archivos después de la creación
         #[arg(long)]
         verify: bool,
     },
-    /// Actualiza la base de datos existente (por implementar)
-    Update {
-        /// Acronym del proyecto a actualizar
-        #[arg(value_name = "ACRONYM")]
-        acronym: String,
-    },
+    /// Actualiza la base de datos existente
+    Update(UpdateArgs),  // <- Cambia aquí: usa UpdateArgs directamente
     /// Clasifica muestras usando la base de datos (por implementar)
     Classify {
-        /// Acronym del proyecto a usar para clasificación
         #[arg(value_name = "ACRONYM")]
         acronym: String,
-        
-        /// Archivo FASTA con las muestras a clasificar
+
         #[arg(value_name = "FASTA_FILE")]
         fasta_file: String,
     },
 }
 
-fn main() {
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let result = match &cli.command {
+    match &cli.command {
         Commands::Init { toml_file, verify } => {
-            match init_command(toml_file) {
-                Ok(_) => {
-                    if *verify {
-                        // Extraer el acronym del archivo TOML para verificación
-                        match extract_acronym_from_toml(toml_file) {
-                            Ok(acronym) => {
-                                match verify_init_files(&acronym) {
-                                    Ok(_) => {
-                                        println!("✓ Verificación completada exitosamente");
-                                        Ok(())
-                                    }
-                                    Err(e) => Err(e),
-                                }
-                            }
-                            Err(e) => Err(e),
-                        }
-                    } else {
-                        Ok(())
-                    }
-                }
-                Err(e) => Err(e),
+            init_command(toml_file)
+                .with_context(|| format!("Error ejecutando init para '{}'", toml_file))?;
+
+            if *verify {
+                let acronym = extract_acronym_from_toml(toml_file)
+                    .with_context(|| format!("Error extrayendo acrónimo de {}", toml_file))?;
+                verify_init_files(&acronym)
+                    .with_context(|| format!("Error verificando init para '{}'", acronym))?;
+                println!("✓ Verificación completada exitosamente");
             }
         }
-        Commands::Update { acronym } => {
-            println!("Comando update por implementar para: {}", acronym);
-            println!("Archivos esperados:");
-            println!("  - {}.db", acronym);
-            println!("  - {}_sketches.bin", acronym);
-            Ok(())
+        Commands::Update(args) => {
+            // Llama a tu función update_command pasando args
+            update_command(args)
+                .with_context(|| "Error ejecutando update")?;
         }
         Commands::Classify { acronym, fasta_file } => {
             println!("Comando classify por implementar");
@@ -89,22 +70,20 @@ fn main() {
             println!("Archivos esperados:");
             println!("  - {}.db", acronym);
             println!("  - {}_sketches.bin", acronym);
-            Ok(())
         }
-    };
-
-    if let Err(e) = result {
-        eprintln!("Error: {}", e);
-        process::exit(1);
     }
+
+    Ok(())
 }
 
 /// Función auxiliar para extraer el acronym de un archivo TOML
-fn extract_acronym_from_toml(toml_path: &str) -> Result<String, Box<dyn std::error::Error>> {
+fn extract_acronym_from_toml(toml_path: &str) -> Result<String> {
     use std::fs;
     use crate::db::db::MetadataConfig;
-    
-    let toml_content = fs::read_to_string(toml_path)?;
-    let config: MetadataConfig = toml::from_str(&toml_content)?;
+
+    let toml_content = fs::read_to_string(toml_path)
+        .with_context(|| format!("No se pudo leer {}", toml_path))?;
+    let config: MetadataConfig = toml::from_str(&toml_content)
+        .with_context(|| format!("No se pudo parsear TOML {}", toml_path))?;
     Ok(config.acronym)
 }

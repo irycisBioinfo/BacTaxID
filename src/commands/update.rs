@@ -10,7 +10,7 @@ use crate::graph::exists_clique;
 use crate::{
 
     sketch::sketching::*,
-    db::db::DuckDb,
+    db::db::*,
     graph::*,
 };
 
@@ -21,9 +21,6 @@ pub struct UpdateArgs {
     #[arg(long, required = true, value_name = "DB_PATH")]
     pub db: String,
 
-    /// Ruta al SketchManager serializado
-    #[arg(long, required = true, value_name = "SKETCH_PATH")]
-    pub sketch: String,
 
     /// Número de CPUs para paralelizar con rayon
     #[arg(long, value_name = "N_CPUS", default_value_t = 1)]
@@ -141,9 +138,17 @@ fn load_metadata_map(conn: &Connection) -> Result<HashMap<String, String>> {
     let row = row_stmt.query_row([], |r| {
         let mut map = HashMap::new();
         for (i, col) in cols.iter().enumerate() {
-            // Todo metadata lo guardamos como texto para simplicidad
-            let val: Option<String> = r.get(i)?;
-            map.insert(col.clone(), val.unwrap_or_default());
+            // Leer como Value genérico y convertir a String
+            let val: Option<duckdb::types::Value> = r.get(i)?;
+            let val_str = match val {
+                Some(duckdb::types::Value::Int(i)) => i.to_string(),
+                Some(duckdb::types::Value::Double(f)) => f.to_string(),  // <-- Cambio aquí
+                Some(duckdb::types::Value::Text(s)) => s,
+                Some(duckdb::types::Value::Boolean(b)) => b.to_string(),
+                Some(v) => format!("{:?}", v), // Para otros tipos, usar debug format
+                None => String::new(),
+            };
+            map.insert(col.clone(), val_str);
         }
         Ok(map)
     }).context("Error leyendo fila de metadata")?;
@@ -152,20 +157,18 @@ fn load_metadata_map(conn: &Connection) -> Result<HashMap<String, String>> {
     Ok(row)
 }
 
+
 /// Función principal del comando update
 pub fn update_command(args: &UpdateArgs) -> Result<()> {
     println!("=== Iniciando comando update ===");
     println!("Database: {}", args.db);
-    println!("SketchManager: {}", args.sketch);
+
     println!("CPUs: {}", args.cpus);
     println!("Lista de archivos: {}", args.files);
 
     // Verificar que los archivos existen
     if !Path::new(&args.db).exists() {
         return Err(anyhow::anyhow!("Base de datos no encontrada: {}", args.db));
-    }
-    if !Path::new(&args.sketch).exists() {
-        return Err(anyhow::anyhow!("SketchManager no encontrado: {}", args.sketch));
     }
     if !Path::new(&args.files).exists() {
         return Err(anyhow::anyhow!("Lista de archivos no encontrada: {}", args.files));
@@ -197,14 +200,54 @@ pub fn update_command(args: &UpdateArgs) -> Result<()> {
     println!("Click threshold: {}", ctx.click_threshold());
     println!("Niveles disponibles: {}", ctx.levels.len());
 
-    // ✅ SOLUCIÓN: Extraer el valor del Result antes de usar
-    let sketch_manager = SketchManager::load_from_disk(&args.sketch)
-        .with_context(|| format!("Error cargando SketchManager: {}", args.sketch))?;
+  // Cargar SketchManager desde DuckDB usando UpdateCtx
+let mut sketch_manager_result = load_sketch_manager_from_db(
+    ctx.conn,
+    ctx.kmer_size(),
+    ctx.sketch_size()
+);
 
-    println!("✓ SketchManager cargado. Contiene {} sketches", sketch_manager.length());
+match &mut sketch_manager_result {
+    Ok(sketch_manager) => {
+        println!(
+            "✓ SketchManager cargado desde DB. Contiene {} sketches",
+            sketch_manager.length()
+        );
+
+        for line in fs::read_to_string(&args.files)
+            .with_context(|| format!("Error leyendo archivo de lista de archivos: {}", args.files))?
+            .lines()
+        {
+            let fasta_path = Path::new(line.trim());
+            if !fasta_path.exists() {
+                eprintln!("Archivo FASTA no encontrado: {}", fasta_path.display());
+                continue;
+            }
+
+            let sample_name = fasta_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+
+            if sketch_manager.contains(&sample_name) {
+                println!("✓ El sketch para {} ya existe, se omitirá.", sample_name);
+                continue;
+            }
+
+            update_single_file(fasta_path, &mut ctx, sketch_manager)?; // Mut borrow aquí
+        }
+    }
+    Err(ref e) => {
+        // Manejo de error; puedes personalizar según tu flujo
+        eprintln!("Error al cargar SketchManager desde la base de datos: {e}");
+        // return Err(e.clone().into()); // si quieres propagar el error
+    }
+}
 
 
 
+    
     // TODO: Aquí se agregará la lógica para:
     // 1. Comparar sketches query vs reference
     // 2. Actualizar contadores en level_counts
@@ -375,13 +418,24 @@ pub fn update_single_file(
                 
             }
         } 
-        update_duckdb(
+        
+        
+
+    }
+    update_duckdb(
             ctx.connection_mut(),
             &query
         )?;
-        //update_sketch_manager
 
-    }
+        // -------- 4. Guardar el sketch en la tabla sketches --------
+    let sketch = query.sketch.get_sketch(&query.sample_name)
+        .expect("El sketch debería existir después de Query::new()");
+
+    insert_sketch_object(
+        ctx.conn,
+        &query.sample_name,
+        sketch
+    ).with_context(|| format!("Error guardando sketch para muestra: {}", query.sample_name))?;
 
     println!(
         "✓ Procesamiento completo • muestra: {} • código final: {:?}",

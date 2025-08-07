@@ -1,0 +1,9 @@
+genus = "Prueba"
+acronym = "PRB"
+levels = "[0.95,0.97,0.98,0.99,0.999]"
+kmer_size = 21
+sketch_size = 1200
+click_size = 8
+click_threshold = 0.8
+reference_size = 100
+

@@ -8,6 +8,7 @@ use std::fs::File;
 use std::io::{BufWriter,BufReader};
 use rayon::prelude::*;
 use anyhow::{Result, Context, anyhow, bail};
+use duckdb::Connection;
 
 use std::{
     error::Error,
@@ -144,6 +145,10 @@ impl SketchManager {
         self.sketches.len()
     }
 
+    pub fn contains(&self, name: &str) -> bool {
+        self.sketches.contains_key(name)
+    }
+
     /// Calcula la distancia entre dos sketches por nombre
     pub fn distance_between(&self, name1: &str, name2: &str) -> Result<f64> {
         let sketch1 = self.sketches.get(name1)
@@ -160,46 +165,81 @@ impl SketchManager {
     }
 
     /// 3. Guarda el HashMap en disco usando bincode
-    pub fn save_to_disk<P: AsRef<Path>>(&self, file_path: P) -> Result<()> {
-        let file = File::create(file_path)?;
-        let writer = BufWriter::new(file);
+    // pub fn save_to_disk<P: AsRef<Path>>(&self, file_path: P) -> Result<()> {
+    //     // Crear el archivo de salida
+    //     let file = File::create(file_path)?;
+    //     let writer = BufWriter::new(file);
         
-        // Serializar usando bincode
-        bincode::serialize_into(writer, self)?;
+    //     // Serializar usando bincode
+    //     bincode::serialize_into(writer, self)?;
         
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
-    /// 4. Carga el HashMap desde disco usando bincode
-    pub fn load_from_disk<P: AsRef<Path>>(file_path: P) -> Result<Self> {
-        let file = File::open(file_path)?;
-        let reader = BufReader::new(file);
+    // /// 4. Carga el HashMap desde disco usando bincode
+    // pub fn load_from_disk<P: AsRef<Path>>(file_path: P) -> Result<Self> {
+    //     // Abrir el archivo de entrada
+    //     let file = File::open(file_path)?;
+    //     let reader = BufReader::new(file);
         
-        // Deserializar usando bincode
-        let sketch_manager: SketchManager = bincode::deserialize_from(reader)?;
+    //     // Deserializar usando bincode
+    //     let sketch_manager: SketchManager = bincode::deserialize_from(reader)?;
         
-        Ok(sketch_manager)
-    }
+    //     Ok(sketch_manager)
+    // }
 
     /// Función auxiliar para verificar si existe un archivo
     pub fn file_exists<P: AsRef<Path>>(file_path: P) -> bool {
         file_path.as_ref().exists()
     }
 
-    /// Carga desde disco si existe, sino crea uno nuevo
-    pub fn load_or_create<P: AsRef<Path>>(
-        file_path: P,
-        default_kmer_size: usize,
-        default_sketch_size: usize,
-    ) -> Result<Self> {
-        if Self::file_exists(&file_path) {
-            Self::load_from_disk(file_path)
-        } else {
-            Ok(Self::new(default_kmer_size, default_sketch_size))
-        }
-    }
+
 }
 
+
+pub fn load_sketch_manager_from_db(
+    conn: &Connection,
+    default_kmer_size: usize,
+    default_sketch_size: usize
+) -> Result<SketchManager> {
+    // 1. Obtener todos los datos serializados de forma secuencial
+    let mut stmt = conn.prepare("SELECT sample, sketch FROM sketches")?;
+    let rows = stmt.query_map([], |row| {
+        let sample_id: String = row.get(0)?;
+        let sketch_data: Vec<u8> = row.get(1)?;
+        Ok((sample_id, sketch_data))
+    })?;
+
+    // 2. Recoger en un Vec para paralelizar
+    let raw_data: Result<Vec<_>, _> = rows.collect();
+    let raw_data = raw_data?;
+
+    // Si no hay filas, crear un SketchManager vacío
+    if raw_data.is_empty() {
+        return Ok(SketchManager {
+            sketches: HashMap::new(),
+            default_kmer_size,
+            default_sketch_size,
+        });
+    }
+
+    // 3. Paralelizar la deserialización y construcción del HashMap
+    let sketches: HashMap<String, Sketch> = raw_data
+        .into_par_iter()
+        .map(|(sample_id, sketch_data)| {
+            let sketch: Sketch = bincode::deserialize(&sketch_data)
+                .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
+            Ok((sample_id, sketch))
+        })
+        .collect::<Result<HashMap<_, _>, duckdb::Error>>()?;
+
+    // 4. Construir el SketchManager
+    Ok(SketchManager {
+        sketches,
+        default_kmer_size,
+        default_sketch_size,
+    })
+}
 
 /// Construye un b
 /// - Usa binning directo en lugar de heap O(log S).

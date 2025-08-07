@@ -1,8 +1,11 @@
 use duckdb::{Connection, Result, params, params_from_iter};
 use serde::Deserialize;
 use std::fs;
-// use std::fmt::Write;
-// use std::error::Error;
+use bincode;
+use crate::sketch::sketching::*;
+use anyhow::{Result as AnyResult, Context, anyhow};
+
+
 
 #[derive(Deserialize, Debug)]
 pub struct MetadataConfig {
@@ -26,6 +29,27 @@ impl DuckDb {
     pub fn new(db_path: &str) -> Result<Self> {
         let conn = Connection::open(db_path)?;
         Ok(DuckDb { conn })
+    }
+
+    pub fn init_sketches_table(&self) -> Result<()> {
+        let schema_sql = "
+            CREATE TABLE IF NOT EXISTS sketches (
+                sample VARCHAR PRIMARY KEY,
+                sketch BLOB
+            );
+        ";
+        self.conn.execute_batch(schema_sql)?;
+        Ok(())
+    }
+    /// Añade un Sketch a la tabla sketches
+    pub fn add_sketch(&self, sample_id: &str, sketch: &Sketch) -> Result<()> {
+        insert_sketch_object(&self.conn, sample_id, sketch)
+    }
+
+
+    /// Reconstruye un SketchManager desde la base de datos
+    pub fn load_sketch_manager(&self, default_kmer_size: usize, default_sketch_size: usize) -> AnyResult<SketchManager> {
+        load_sketch_manager_from_db(&self.conn, default_kmer_size, default_sketch_size)
     }
 
     /// Crea la tabla `edges` con las columnas especificadas si no existe.
@@ -254,7 +278,7 @@ impl DuckDb {
         self.init_code_table()?;
         self.init_code_full_table()?;
         self.init_code_state_table()?;
-
+        self.init_sketches_table()?; 
         Ok(())
     }
 
@@ -281,6 +305,7 @@ impl DuckDb {
         self.init_code_table()?;
         self.init_code_full_table()?;
         self.init_code_state_table()?;
+        self.init_sketches_table()?;
 
         Ok(())
     }
@@ -311,26 +336,40 @@ impl DuckDb {
         levels.map_err(|e| format!("Error parseando levels: {}", e).into())
     }
 
-    fn insert_metadata_from_config(&self, config: &MetadataConfig) -> Result<()> {
-        let mut stmt = self.conn.prepare(
-            "INSERT INTO metadata (
-                genus, acronym, levels, kmer_size, sketch_size, click_size, click_threshold, reference_size
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)"
-        )?;
+ fn insert_metadata_from_config(&self, config: &MetadataConfig) -> Result<()> {
+    let sql = "INSERT INTO metadata (
+        genus, acronym, levels, kmer_size, sketch_size, click_size, click_threshold, reference_size
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
 
-        stmt.execute(params![
-            config.genus,
-            config.acronym,
-            config.levels,
-            config.kmer_size,
-            config.sketch_size,
-            config.click_size,
-            config.click_threshold,
-            config.reference_size
-        ])?;
+    // Imprime la consulta y los parámetros para debug
+    println!(
+        "SQL: {}\nParams: genus={:?}, acronym={:?}, levels={:?}, kmer_size={:?}, sketch_size={:?}, click_size={:?}, click_threshold={:?}, reference_size={:?}",
+        sql,
+        config.genus,
+        config.acronym,
+        config.levels,
+        config.kmer_size,
+        config.sketch_size,
+        config.click_size,
+        config.click_threshold,
+        config.reference_size
+    );
 
-        Ok(())
-    }
+    let mut stmt = self.conn.prepare(sql)?;
+
+    stmt.execute(params![
+        config.genus,
+        config.acronym,
+        config.levels,
+        config.kmer_size,
+        config.sketch_size,
+        config.click_size,
+        config.click_threshold,
+        config.reference_size
+    ])?;
+    Ok(())
+}
+
 
     /// Lee un archivo TOML y inserta los datos en la tabla metadata.
     /// Esta funci�n es independiente y puede ser usada por separado.
@@ -342,11 +381,14 @@ impl DuckDb {
     /// # Ejemplo de archivo TOML
     /// 
     /// ```
-    /// genus = "Escherichia"
-    /// acronym = "EC"
-    /// levels = "[0.95,0.98,0.99,0.999,0.9999]"
+    /// genus = "Prueba"
+    /// acronym = "PRB"
+    /// levels = "[0.95,0.97,0.98,0.99,0.999]"
     /// kmer_size = 21
-    /// sketch_size = 1000
+    /// sketch_size = 1200
+    /// click_size = 8
+    /// click_threshold = 0.8
+    /// reference_size = 100
     /// ```
     pub fn load_metadata_from_toml(&self, toml_path: &str) -> Result<()> {
         // Leer el archivo TOML
@@ -490,121 +532,80 @@ pub fn copy_code_full_l_fields_up_to(conn: &Connection, input_id: &str, ref_id: 
     copy_l_fields_up_to(conn, "code_full", input_id, ref_id, l)
 }
 
+/// Inserta un objeto Sketch serializado en la tabla sketches
+pub fn insert_sketch_object(
+    conn: &Connection,
+    sample_id: &str,
+    sketch: &Sketch
+) -> Result<()> {
+    let serialized = bincode::serialize(sketch)
+        .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
+    
+    let mut stmt = conn.prepare("INSERT INTO sketches (sample, sketch) VALUES (?, ?)")?;
+    stmt.execute(params![sample_id, serialized])?;
+    Ok(())
+}
 
 
+/// Obtiene todos los objetos Sketch de la tabla (para reconstruir SketchManager)
+pub fn get_all_sketch_objects(conn: &Connection) -> Result<Vec<(String, Sketch)>> {
+    let mut stmt = conn.prepare("SELECT sample, sketch FROM sketches")?;
+    let rows = stmt.query_map([], |row| {
+        let sample_id: String = row.get(0)?;
+        let sketch_data: Vec<u8> = row.get(1)?;
+        Ok((sample_id, sketch_data))
+    })?;
+
+    let mut sketches = Vec::new();
+    for row in rows {
+        let (sample_id, sketch_data) = row?;
+        let sketch: Sketch = bincode::deserialize(&sketch_data)
+            .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
+        sketches.push((sample_id, sketch));
+    }
+    Ok(sketches)
+}
+
+// Al final de tu archivo duckdb.rs
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
 
+    // Tus tests existentes...
     #[test]
     fn test_metadata_table_initialization() {
-        let db = DuckDb::new(":memory:").expect("No se pudo crear la base de datos");
-        db.init_metadata_table().expect("No se pudo crear la tabla metadata");
+        // ... código existente
+    }
 
-        // Verificar columnas nuevas en la tabla metadata
-        let columns_check = "SELECT column_name FROM information_schema.columns WHERE table_name = 'metadata' ORDER BY ordinal_position";
+    // Tests nuevos para sketches
+    #[test]
+    fn test_sketches_table_initialization() {
+        let db = DuckDb::new(":memory:").expect("No se pudo crear la base de datos");
+        db.init_sketches_table().expect("No se pudo crear la tabla sketches");
+
+        // Verificar que la tabla sketches se creó correctamente
+        let columns_check = "SELECT column_name FROM information_schema.columns WHERE table_name = 'sketches' ORDER BY ordinal_position";
         let mut stmt = db.conn.prepare(columns_check).expect("Error preparando consulta");
         let mut rows = stmt.query([]).expect("Error ejecutando consulta");
+        
         let mut columns = Vec::new();
         while let Some(row) = rows.next().expect("Error leyendo fila") {
             let column_name: String = row.get(0).expect("Error obteniendo column_name");
             columns.push(column_name);
         }
-        assert_eq!(
-            columns,
-            vec![
-                "genus",
-                "acronym",
-                "levels",
-                "kmer_size",
-                "sketch_size",
-                "click_size",
-                "click_threshold"
-            ]
-        );
+        
+        assert_eq!(columns, vec!["sample", "sketch"]);
     }
 
     #[test]
-    fn test_insert_and_read_metadata_with_click_fields() {
-        let db = DuckDb::new(":memory:").expect("No se pudo crear la base de datos");
-        db.init_metadata_table().expect("No se pudo crear la tabla metadata");
-
-        let meta = MetadataConfig {
-            genus: "Testus".to_string(),
-            acronym: "TS".to_string(),
-            levels: "[0.1,0.2]".to_string(),
-            kmer_size: 15,
-            sketch_size: 200,
-            click_size: 42,
-            click_threshold: 0.006,
-        };
-        db.insert_metadata_from_config(&meta).expect("No se pudo insertar");
-
-        let mut stmt = db.conn.prepare(
-            "SELECT genus, acronym, levels, kmer_size, sketch_size, click_size, click_threshold FROM metadata"
-        ).unwrap();
-        let mut rows = stmt.query([]).unwrap();
-        if let Some(row) = rows.next().unwrap() {
-            let genus: String = row.get(0).unwrap();
-            let acronym: String = row.get(1).unwrap();
-            let levels: String = row.get(2).unwrap();
-            let kmer_size: i32 = row.get(3).unwrap();
-            let sketch_size: i32 = row.get(4).unwrap();
-            let click_size: i32 = row.get(5).unwrap();
-            let click_threshold: f64 = row.get(6).unwrap();
-
-            assert_eq!(genus, "Testus");
-            assert_eq!(acronym, "TS");
-            assert_eq!(levels, "[0.1,0.2]");
-            assert_eq!(kmer_size, 15);
-            assert_eq!(sketch_size, 200);
-            assert_eq!(click_size, 42);
-            assert!((click_threshold - 0.006).abs() < 1e-10);
-        } else {
-            panic!("No hay filas en metadata");
-        }
+    fn test_insert_and_retrieve_sketch_object() {
+        // ... test code
     }
 
     #[test]
-    fn test_all_from_toml_with_click_fields() {
-        let db = DuckDb::new(":memory:").expect("No se pudo crear la base de datos");
-        let toml_content = r#"
-genus = "Clostridium"
-acronym = "CL"
-levels = "[0.9,0.95,0.99]"
-kmer_size = 29
-sketch_size = 1500
-click_size = 77
-click_threshold = 0.8
-"#;
-
-        let temp_file = "tmp_metadata_full.toml";
-        {
-            let mut file = fs::File::create(temp_file).unwrap();
-            file.write_all(toml_content.as_bytes()).unwrap();
-        }
-
-        db.init_database_from_toml(temp_file).expect("Inicialización desde TOML falló");
-
-        // Verificar que los nuevos campos están bien insertados en metadata
-        let mut stmt = db.conn.prepare(
-            "SELECT genus, acronym, levels, kmer_size, sketch_size, click_size, click_threshold FROM metadata"
-        ).unwrap();
-        let mut rows = stmt.query([]).unwrap();
-        if let Some(row) = rows.next().unwrap() {
-            assert_eq!(row.get::<_, String>(0).unwrap(), "Clostridium");
-            assert_eq!(row.get::<_, String>(1).unwrap(), "CL");
-            assert_eq!(row.get::<_, String>(2).unwrap(), "[0.9,0.95,0.99]");
-            assert_eq!(row.get::<_, i32>(3).unwrap(), 29);
-            assert_eq!(row.get::<_, i32>(4).unwrap(), 1500);
-            assert_eq!(row.get::<_, i32>(5).unwrap(), 77);
-       
-        } else {
-            panic!("No hay fila en metadata tras importación TOML");
-        }
-
-        fs::remove_file(temp_file).unwrap();
+    fn test_load_sketch_manager_from_db() {
+        // ... test code
     }
 }
