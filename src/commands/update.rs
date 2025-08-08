@@ -421,6 +421,7 @@ pub fn update_single_file(
             let click_size = ctx.click_size();
             let conn = ctx.connection_mut();
             look_for_cliques(conn, &distances, i, &levels, click_size, &mut query)?;
+            break;
         } else {
             break;
         }
