@@ -31,7 +31,7 @@ pub fn exists_clique(
          FROM edges                     \
          WHERE source IN ({})           \
            AND target IN ({})           \
-           AND dist < ?",
+           AND dist > ?",
         placeholders, placeholders
     );
 
@@ -105,14 +105,14 @@ pub fn exists_clique(
 /// # Parámetros:
 /// - `conn`      : Conexión mutable a DuckDB.
 /// - `edge_ids`  : Slice de `i64` con los IDs (primary key) a eliminar.
-/// - `dist_max`  : Distancia máxima; solo se eliminan edges con `dist < dist_max`.
+/// - `dist_max`  : Distancia minima; solo se eliminan edges con `dist < dist_min`.
 ///
 /// # Retorna:
 /// - `Ok(())` en caso de éxito, o `Err` en caso de error de base de datos.
 pub fn delete_edges_by_ids(
     conn: &mut Connection,
     edge_ids: &[i64],
-    dist_max: f64,
+    dist_min: f64,
 ) -> Result<(), duckdb::Error> {
     if edge_ids.is_empty() {
         return Ok(());
@@ -130,7 +130,7 @@ pub fn delete_edges_by_ids(
         insert_stmt.execute(params![id])?;
     }
     
-    // Eliminar solo aquellos edges con id en temp_table y dist < dist_max
+    // Eliminar solo aquellos edges con id en temp_table y dist < dist_min
     let deleted = tx.execute(
         &format!(
             "DELETE FROM edges \
@@ -138,7 +138,7 @@ pub fn delete_edges_by_ids(
                AND dist < ?",
             temp_table
         ),
-        params![dist_max],
+        params![dist_min],
     )?;
     
     // Limpiar tabla temporal

@@ -291,8 +291,14 @@ pub fn jaccard_index(sketch1: &[u64], sketch2: &[u64], kmer_size: usize) -> f64 
         return 1.0; // Distancia máxima
     }
 
-    // Distancia Mash: D = -1/k * ln(2j/(1+j))
-    -((2. * jaccard_value) / (1. + jaccard_value)).ln() / kmer_size as f64
+      // Calcular distancia Mash: D = -1/k * ln(2j/(1+j))
+    let mash_distance = -((2.0 * jaccard_value) / (1.0 + jaccard_value)).ln() / kmer_size as f64;
+    
+    // Convertir distancia Mash a ANI
+    let ani = 1.0 - mash_distance;
+    
+    // Asegurar que ANI esté en el rango [0, 1]
+    ani.max(0.0).min(1.0)
 }
 /// Compara los sketches de query_manager contra un subconjunto específico de sketches 
 /// en reference_manager, devolviendo solo aquellas comparaciones con distancia < max_dist.
@@ -309,13 +315,13 @@ pub fn pw_one_to_many(
     query_manager: &SketchManager,
     reference_manager: &SketchManager,
     subset_ids: &[String],
-    max_dist: f64,
+    min_dist: f64,
 ) -> Vec<(String, String, f64)> {
     query_manager.sketches.par_iter().flat_map(|(source_name, source_sketch)| {
         subset_ids.par_iter().filter_map(move |target_id| {
             reference_manager.get_sketch(target_id).and_then(|target_sketch| {
                 let dist = source_sketch.distance(target_sketch);
-                if dist < max_dist {
+                if dist > min_dist {
                     Some((source_name.clone(), target_id.clone(), dist))
                 } else {
                     None

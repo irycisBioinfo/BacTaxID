@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::fs;
 use bincode;
 use crate::sketch::sketching::*;
-use anyhow::{Result as AnyResult, Context, anyhow};
+use anyhow::{Result as AnyResult, Context, bail, anyhow};
 
 
 
@@ -69,8 +69,8 @@ impl DuckDb {
 
     /// Crea e inicializa la tabla `levels` con datos basados en el Vec<u64> proporcionado.
     /// Los valores de Level ser�n "L_0", "L_1", ..., "L_N" donde N es el n�mero de elementos.
-    /// Los valores de Dist corresponden a los valores del Vec<u64> convertidos a DOUBLE.
-    pub fn init_levels_table(&self, distances: Vec<u64>) -> Result<()> {
+    /// Los valores de Dist corresponden a los valores del Vec<f64> convertidos a DOUBLE.
+    pub fn init_levels_table(&self, distances: Vec<f64>) -> Result<()> {
         // Crear la tabla si no existe
         let create_table_sql = "
             CREATE TABLE IF NOT EXISTS levels (
@@ -258,20 +258,16 @@ impl DuckDb {
 
         // 2. Parsear el campo levels usando funci�n asociada
         let levels_vec = Self::parse_levels_string(&config.levels)
-            .map_err(|e| duckdb::Error::ToSqlConversionFailure(e))?;
-
-        // 3. Convertir Vec<f64> a Vec<u64>
-        let levels_u64: Vec<u64> = levels_vec
-            .iter()
-            .map(|&x| (x * 100000.0) as u64)
-            .collect();
+            .map_err(|e| duckdb::Error::ToSqlConversionFailure(e.into()))?;
+        println!("Parsed levels: {:?}", levels_vec);
+    
 
         // 4. Inicializar tabla metadata
         self.init_metadata_table()?;
         self.insert_metadata_from_config(&config)?;
 
         // 5. Inicializar tabla levels
-        self.init_levels_table(levels_u64)?;
+        self.init_levels_table(levels_vec)?;
 
         // 6. Inicializar todas las dem�s tablas
         self.init_edges_table()?;
@@ -285,20 +281,15 @@ impl DuckDb {
     pub fn init_all_tables_from_config(&self, config: &MetadataConfig) -> Result<()> {
         // 2. Parsear el campo levels usando función asociada
         let levels_vec = Self::parse_levels_string(&config.levels)
-            .map_err(|e| duckdb::Error::ToSqlConversionFailure(e))?;
-
-        // 3. Convertir Vec<f64> a Vec<u64>
-        let levels_u64: Vec<u64> = levels_vec
-            .iter()
-            .map(|&x| (x * 100000.0) as u64)
-            .collect();
+            .map_err(|e| duckdb::Error::ToSqlConversionFailure(e.into()))?;
+        println!("Parsed levels: {:?}", levels_vec);
 
         // 4. Inicializar tabla metadata
         self.init_metadata_table()?;
         self.insert_metadata_from_config(config)?;
 
         // 5. Inicializar tabla levels
-        self.init_levels_table(levels_u64)?;
+        self.init_levels_table(levels_vec)?;
 
         // 6. Inicializar todas las demás tablas
         self.init_edges_table()?;
@@ -310,31 +301,45 @@ impl DuckDb {
         Ok(())
     }
     
-    /// Funci�n auxiliar para parsear el string de levels a Vec<f64>
-    /// 
-    /// # Argumentos
-    /// 
-    /// * `levels_str` - String en formato "[0.95,0.98,0.99,0.999,0.9999]"
-    /// 
-    /// # Retorna
-    /// 
-    /// Result<Vec<f64>, Box<dyn std::error::Error + Send + Sync>> - Vector de valores f64 o error de parsing
-    fn parse_levels_string(levels_str: &str) -> Result<Vec<f64>, Box<dyn std::error::Error + Send + Sync>> {
-        // Remover corchetes y espacios
-        let cleaned = levels_str
-            .trim()
-            .strip_prefix('[')
-            .and_then(|s| s.strip_suffix(']'))
-            .ok_or("El string de levels debe estar entre corchetes []")?;
 
-        // Dividir por comas y parsear cada valor
-        let levels: Result<Vec<f64>, _> = cleaned
-            .split(',')
-            .map(|s| s.trim().parse::<f64>())
-            .collect();
 
-        levels.map_err(|e| format!("Error parseando levels: {}", e).into())
-    }
+/// Función auxiliar para parsear el string de levels a Vec<f64>
+/// 
+/// # Argumentos
+/// 
+/// * `levels_str` - String en formato "[0.95,0.97,0.98,0.99,0.999]"
+/// 
+/// # Retorna
+/// 
+/// anyhow::Result<Vec<f64>> - Vector de valores f64 o error
+fn parse_levels_string(levels_str: &str) -> AnyResult<Vec<f64>> {
+    // Remover corchetes y espacios
+    let cleaned = levels_str
+        .trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .context("El string de levels debe estar entre corchetes []")?;
+
+    // Dividir por comas y parsear cada valor
+    let levels: AnyResult<Vec<f64>> = cleaned
+        .split(',')
+        .map(|s| {
+            let value = s.trim().parse::<f64>()
+                .with_context(|| format!("Error parseando el valor '{}'", s.trim()))?;
+            
+            // Validación: asegurar que esté entre 0 y 1
+            if value < 0.0 || value > 1.0 {
+                bail!("Valor fuera del rango [0,1]: {}", value);
+            }
+            
+            Ok(value)
+        })
+        .collect();
+
+    levels.context("Error procesando los valores de levels")
+}
+
+
 
  fn insert_metadata_from_config(&self, config: &MetadataConfig) -> Result<()> {
     let sql = "INSERT INTO metadata (

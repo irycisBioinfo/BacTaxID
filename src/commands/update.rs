@@ -310,7 +310,7 @@ impl Query {
 pub fn update_single_file(
     fasta_path: &Path,
     ctx: &mut UpdateCtx,
-    _sketch_manager: &SketchManager, // SketchManager de referencia
+    _sketch_manager: &mut SketchManager,
 ) -> Result<()> {
     // -------- 1. Crear Query (incluye validaciones, sketch y vectores) --------
     let mut query = Query::new(fasta_path, ctx)?;
@@ -324,9 +324,8 @@ pub fn update_single_file(
     );
 
     // -------- 2. Variables para el procesamiento --------
-
-    let mut ref_db: Vec<(String, usize, String, String)>; // (sample, code, code_full, code_state)
-    let mut distances: Vec<(String, String, f64)>; // (query_name, ref_name, distance)
+    let mut ref_db: Vec<(String, usize, String, String)>;
+    let mut distances: Vec<(String, String, f64)>;
     let mut bh: Option<(String, usize, String, String)> = None;
     let mut ref_ids: Vec<String> = Vec::new();
 
@@ -336,106 +335,108 @@ pub fn update_single_file(
 
     // -------- 3. Procesar cada nivel en orden ascendente de distancia --------
     for i in 0..ctx.levels.len() {
+        // 3.1 Recuperar clasificadores iniciales (condition = "C")
         ref_db = if i == 0 {
-            retrive_classifiers(
-                ctx.connection_mut(),
-                i,
-                "" // Nivel 0 no tiene grupo, se ignora (puede ser cualquier string)
-            )?
+            retrieve_classifiers(ctx.connection_mut(), i, "", "C")?
         } else {
-            retrive_classifiers(
-                ctx.connection_mut(),
-                i,
-                &query.code_full[i - 1] // Usar el grupo del nivel anterior
-            )?
+            retrieve_classifiers(ctx.connection_mut(), i, &query.code_full[i - 1], "C")?
         };
-        
-        // Extraer solo los sample names del resultado de retrive_classifiers
         ref_ids = ref_db.iter().map(|(sample, _, _, _)| sample.clone()).collect();
+       // println!(
+       //    "Número de referencias para {} en nivel {}: {}",
+       //     query.sample_name, i, ref_ids.len()
+       // );
+
+        // 3.2 Calcular distancias
+        distances = pw_one_to_many(
+            &query.sketch,
+            _sketch_manager,
+            &ref_ids,
+            ctx.levels[i].1,
+        );
+
+        // 3.3 Procesar distancias
+        if !distances.is_empty() {
+            // 5. Actualizar según best_hit
+            bh = best_hit(&distances, &ref_db);
+
+            // Obtener valores de best_hit
+            let code_val = bh.as_ref().map_or(0, |(_, code, _, _)| *code);
+            let code_full_val = bh
+                .as_ref()
+                .map_or_else(|| "".to_string(), |(_, _, cf, _)| cf.clone());
+
+            if code_val != 0 {
+                // Actualizar query con best hit válido
+                query.code[i] = code_val;
+                query.code_full[i] = code_full_val.clone();
+
+                if is_classifier(
+                    &distances,
+                    bh.as_ref().unwrap(),
+                    &ref_db,
+                    click_threshold,
+                    reference_size,
+                ) {
+                    query.code_state[i] = "C".to_string();
+                }
+                // Continuar al siguiente nivel
+                continue;
+            } else {
+                println!(
+                    "Warning: Best hit code = 0 en nivel {}, tratando como no hay candidatos",
+                    i
+                );
+            }
+        }
+
+        // 3.4 No hay candidatos válidos (o code == 0): buscar con condition = "ALL"
+        println!(
+            "No hay candidatos válidos en nivel {}, buscando con condition = 'ALL'...",
+            i
+        );
+        ref_db = if i == 0 {
+            retrieve_classifiers(ctx.connection_mut(), i, "", "ALL")?
+        } else {
+            retrieve_classifiers(ctx.connection_mut(), i, &query.code_full[i - 1], "ALL")?
+        };
+        ref_ids = ref_db.iter().map(|(sample, _, _, _)| sample.clone()).collect();
+        println!("Número de referencias (ALL): {}", ref_ids.len());
 
         distances = pw_one_to_many(
             &query.sketch,
             _sketch_manager,
             &ref_ids,
-            ctx.levels[i].1  // Acceder al valor f64 de distancia del nivel i
+            ctx.levels[i].1,
         );
-        
-        if distances.len() > 0 { //Existe al menos una distancia válida
-            // 4. Buscar el mejor hit (best hit) entre las distancias
-            bh = best_hit(&distances, &ref_db);
-            
-            // 5. Actualizar los vectores de código y estado según el mejor hit
-           bh = best_hit(&distances, &ref_db);
-           query.code[i] = bh.as_ref().map_or(0, |(_, code, _, _)| *code);
-           query.code_full[i] = bh.as_ref().map_or("".to_string(), |(_, _, code_full, _)| code_full.clone());
-           
-            if is_classifier(
-                &distances,
-                bh.as_ref().unwrap(),
-                &ref_db,
-                click_threshold,
-                reference_size
-            ) {
-                query.code_state[i] = "C".to_string(); // Clasificador
-            } // Si no es clasificador, se queda en "S" (satellite) que es el valor de inicialización por defecto
-        }else{ //No hay candidatos validos entre los clasificadores. BUscar nuevos cliques y crear nuevos grupos
-            if i == 0 {
-                ref_db = retrive_level(
-                    ctx.connection_mut(),
-                    i,
-                    "0" // Nivel 0 no tiene grupo, se ignora
-                )?;
-            } else {
-                ref_db = retrive_level(
-                    ctx.connection_mut(),
-                    i,
-                    &query.code_full[i - 1] // Usar el grupo del nivel anterior
-                )?;
-            }
-            ref_ids = ref_db.iter().map(|(sample, _, _, _)| sample.clone()).collect();
+        println!(
+            "✓ Distancias calculadas en ALL con límite {} para {} muestras",
+            ctx.levels[i].1,
+            distances.len()
+        );
 
-            distances = pw_one_to_many(
-                &query.sketch,
-                _sketch_manager,
-                &ref_ids,
-                ctx.levels[i].1  // Acceder al valor f64 de distancia del nivel i
-            );
-            if distances.len() > 0{
-               // Ahora extraes los valores necesarios de ctx ANTES de llamar a look_for_cliques:
-                let levels = ctx.levels.clone(); // Clonar los niveles para pasarlos a la función
-                let click_size = ctx.click_size();
-                let conn = ctx.connection_mut();  // Préstamo mutable al final
-
-                // Y luego llamas a la función:
-                look_for_cliques(
-                    conn,
-                    &distances,
-                    i,
-                    &levels,
-                    click_size,
-                    &mut query,
-                )?;
-                
-            }
-        } 
-        
-        
-
+        if !distances.is_empty() {
+            // 3.5 Buscar cliques y crear nuevos grupos
+            let levels = ctx.levels.clone();
+            let click_size = ctx.click_size();
+            let conn = ctx.connection_mut();
+            look_for_cliques(conn, &distances, i, &levels, click_size, &mut query)?;
+        } else {
+            break;
+        }
     }
-    update_duckdb(
-            ctx.connection_mut(),
-            &query
-        )?;
 
-        // -------- 4. Guardar el sketch en la tabla sketches --------
-    let sketch = query.sketch.get_sketch(&query.sample_name)
+    // -------- 4. Actualizar la base de datos y guardar sketch --------
+    update_duckdb(ctx.connection_mut(), &query)?;
+    let sketch = query
+        .sketch
+        .get_sketch(&query.sample_name)
         .expect("El sketch debería existir después de Query::new()");
-
-    insert_sketch_object(
-        ctx.conn,
-        &query.sample_name,
-        sketch
-    ).with_context(|| format!("Error guardando sketch para muestra: {}", query.sample_name))?;
+    insert_sketch_object(ctx.conn, &query.sample_name, sketch)
+        .with_context(|| format!("Error guardando sketch para muestra: {}", query.sample_name))?;
+    _sketch_manager
+        .add_sketch(sketch.clone())
+        .with_context(|| format!("Error añadiendo sketch para muestra: {}", query.sample_name))?;
 
     println!(
         "✓ Procesamiento completo • muestra: {} • código final: {:?}",
@@ -443,7 +444,8 @@ pub fn update_single_file(
     );
 
     Ok(())
-}   
+}
+
 
 
 /// Recupera clasificadores que cumplen condiciones específicas de nivel y grupo.
@@ -461,22 +463,31 @@ pub fn update_single_file(
 /// # Ejemplo
 /// ```
 /// // Obtener todos los clasificadores de nivel 0 (ignora group)
-/// let results = retrive_classifiers(conn, 0, "0")?;
+/// let results = retrieve_classifiers(conn, 0, "0")?;
 /// 
 /// // Obtener clasificadores de nivel 2 del grupo "Escherichia"
-/// let results = retrive_classifiers(conn, 2, "1.1")?;
+/// let results = retrieve_classifiers(conn, 2, "1.1")?;
 /// ```
-pub fn retrive_classifiers(
+
+pub fn retrieve_classifiers(
     conn: &Connection,
     level: usize,
     group: &str,
-) -> Result<Vec<(String, usize, String, String)>, duckdb::Error> {
+    condition: &str,
+) -> Result<Vec<(String, usize, String, String)>> {
     
     let level_col = format!("L_{}", level);
     
-    let (sql, params): (String, Vec<&dyn duckdb::ToSql>) = if level == 0 {
-        // Si level == 0, ignora el group, solo filtra por code_state
-        (
+    // Para los filtros, necesitamos usar level-1 (excepto cuando level = 0)
+    let filter_level_col = if level == 0 {
+        format!("L_{}", level)  // Si level es 0, usamos L_0 para ambos filtros
+    } else {
+        format!("L_{}", level - 1)  // Si level > 0, usamos L_(level-1) para ambos filtros
+    };
+    
+    let (sql, params): (String, Vec<&dyn duckdb::ToSql>) = match (level, condition) {
+        // Level 0 con condición 'C'
+        (0, "C") => (
             format!(
                 "SELECT 
                     c.sample,
@@ -486,13 +497,28 @@ pub fn retrive_classifiers(
                 FROM code c
                 JOIN code_full cf ON c.sample = cf.sample  
                 JOIN code_state cs ON c.sample = cs.sample
-                WHERE cs.{level_col} = 'C'"
+                WHERE cs.{level_col} = 'C'"  // ← Cambio: cs.{level_col} en lugar de cs.{filter_level_col}
             ),
             Vec::new()
-        )
-    } else {
-        // Si level > 0, filtra por code_state = 'C' Y code_full = group
-        (
+        ),
+        
+        // Level 0 con condición 'ALL'
+        (0, "ALL") => (
+            format!(
+                "SELECT 
+                    c.sample,
+                    c.{level_col} as code,
+                    cf.{level_col} as code_full,
+                    cs.{level_col} as code_state
+                FROM code c
+                JOIN code_full cf ON c.sample = cf.sample  
+                JOIN code_state cs ON c.sample = cs.sample"
+            ),
+            Vec::new()
+        ),
+        
+        // Level > 0 con condición 'C'
+        (level, "C") if level > 0 => (
             format!(
                 "SELECT 
                     c.sample,
@@ -503,21 +529,84 @@ pub fn retrive_classifiers(
                 JOIN code_full cf ON c.sample = cf.sample  
                 JOIN code_state cs ON c.sample = cs.sample
                 WHERE cs.{level_col} = 'C' 
-                AND cf.{level_col} = ?"
+                AND cf.{filter_level_col} = ?"  // ← cs.{level_col} + cf.{filter_level_col}
             ),
             vec![&group as &dyn duckdb::ToSql]
-        )
+        ),
+        
+        // Level > 0 con condición 'ALL'
+        (level, "ALL") if level > 0 => (
+            format!(
+                "SELECT 
+                    c.sample,
+                    c.{level_col} as code,
+                    cf.{level_col} as code_full,
+                    cs.{level_col} as code_state
+                FROM code c
+                JOIN code_full cf ON c.sample = cf.sample  
+                JOIN code_state cs ON c.sample = cs.sample
+                WHERE cf.{filter_level_col} = ?"  // ← Solo cf.{filter_level_col}
+            ),
+            vec![&group as &dyn duckdb::ToSql]
+        ),
+        
+        // Condición no reconocida
+        _ => {
+            bail!("Invalid condition '{}'. Use 'C' or 'ALL'", condition);
+        }
     };
+
+
 
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query(params.as_slice())?;
 
     let mut result = Vec::new();
+    let mut row_count = 0;
+    
     while let Some(row) = rows.next()? {
-        let sample: String = row.get(0)?;
-        let code: usize = row.get(1)?;
-        let code_full: String = row.get(2)?;
-        let code_state: String = row.get(3)?;
+        row_count += 1;
+        //println!("Processing row {}", row_count);
+        
+        // Manejo seguro de cada columna que puede ser NULL
+        let sample: String = match row.get::<_, Option<String>>(0)? {
+            Some(val) => val,
+            None => {
+                println!("WARNING: NULL sample at row {}, skipping", row_count);
+                continue;
+            }
+        };
+        
+        let code: usize = match row.get::<_, Option<i64>>(1)? {
+            Some(val) => {
+                if val < 0 {
+                    println!("WARNING: Negative code {} at row {}, skipping", val, row_count);
+                    continue;
+                }
+                val as usize
+            },
+            None => {
+                println!("WARNING: NULL code at row {}, skipping", row_count);
+                continue;
+            }
+        };
+        
+        let code_full: String = match row.get::<_, Option<String>>(2)? {
+            Some(val) => val,
+            None => {
+                println!("WARNING: NULL code_full at row {}, using 'UNKNOWN'", row_count);
+                "UNKNOWN".to_string()  // ← Valor por defecto para NULL
+            }
+        };
+        
+        let code_state: String = match row.get::<_, Option<String>>(3)? {
+            Some(val) => val,
+            None => {
+                println!("WARNING: NULL code_state at row {}, using 'UNKNOWN'", row_count);
+                "UNKNOWN".to_string()  // ← Valor por defecto para NULL
+            }
+        };
+        
         
         result.push((sample, code, code_full, code_state));
     }
@@ -525,90 +614,13 @@ pub fn retrive_classifiers(
     Ok(result)
 }
 
-/// Recupera todas las entradas de un nivel específico según criterios especiales.
-/// 
-/// # Argumentos
-/// * `conn` - Conexión a la base de datos DuckDB
-/// * `level` - Nivel taxonómico (0, 1, 2, 3, 4...)
-/// * `code_full_value` - Valor de code_full a filtrar (ignorado si level == 0)
-/// 
-/// # Retorna
-/// Vector de tuplas (sample, code, code_full, code_state) donde:
-/// - Si level == 0: code_state.L_0 == "C" OR code.L_0 == 0
-/// - Si level > 0: code_full.L_{level} == code_full_value
-/// 
-/// # Ejemplo
-/// ```
-/// // Obtener todas las entradas de nivel 0 (clasificadas o sin clasificar)
-/// let results = retrive_level(conn, 0, "ignored")?;
-/// 
-/// // Obtener todas las entradas de nivel 2 con code_full = "Escherichia"
-/// let results = retrive_level(conn, 2, "Escherichia")?;
-/// ```
-pub fn retrive_level(
-    conn: &Connection,
-    level: usize,
-    code_full_value: &str,
-) -> Result<Vec<(String, usize, String, String)>, duckdb::Error> {
-    
-    let level_col = format!("L_{}", level);
-    
-    let (sql, params): (String, Vec<&dyn duckdb::ToSql>) = if level == 0 {
-        // Si level == 0: code_state.L_0 == "C" OR code.L_0 == 0
-        (
-            format!(
-                "SELECT 
-                    c.sample,
-                    c.{level_col} as code,
-                    cf.{level_col} as code_full,
-                    cs.{level_col} as code_state
-                FROM code c
-                JOIN code_full cf ON c.sample = cf.sample  
-                JOIN code_state cs ON c.sample = cs.sample
-                WHERE cs.{level_col} = 'C' OR c.{level_col} = 0"
-            ),
-            Vec::new()
-        )
-    } else {
-        // Si level > 0: code_full.L_{level} == code_full_value
-        (
-            format!(
-                "SELECT 
-                    c.sample,
-                    c.{level_col} as code,
-                    cf.{level_col} as code_full,
-                    cs.{level_col} as code_state
-                FROM code c
-                JOIN code_full cf ON c.sample = cf.sample  
-                JOIN code_state cs ON c.sample = cs.sample
-                WHERE cf.{level_col} = ?"
-            ),
-            vec![&code_full_value as &dyn duckdb::ToSql]
-        )
-    };
-
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query(params.as_slice())?;
-
-    let mut result = Vec::new();
-    while let Some(row) = rows.next()? {
-        let sample: String = row.get(0)?;
-        let code: i32 = row.get(1)?;  // Obtener como i32 primero
-        let code_full: String = row.get(2)?;
-        let code_state: String = row.get(3)?;
-        
-        result.push((sample, code as usize, code_full, code_state));  // Convertir a usize
-    }
-
-    Ok(result)
-}
 
 
 /// Encuentra la distancia mínima y devuelve la tupla correspondiente de ref_db.
 /// 
 /// # Argumentos
 /// * `distances` - Vector de tuplas (query_name, ref_name, distance)
-/// * `ref_db` - Vector de tuplas (sample, code, code_full, code_state) de retrive_classifiers
+/// * `ref_db` - Vector de tuplas (sample, code, code_full, code_state) de retrieve_classifiers
 /// 
 /// # Retorna
 /// Option con la tupla de ref_db que tiene el sample correspondiente al mejor hit,
@@ -621,8 +633,8 @@ pub fn best_hit(
     let best_distance = distances
         .iter()
         .filter(|(_, _, dist)| !dist.is_nan())  // Filtrar NaN
-        .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap())?;  // Comparar por distancia (índice 2)
-    
+        .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap())?;  // Comparar por distancia (índice 2)
+    //println!("Mejor hit encontrado: {} con distancia {:.4}", best_distance.1, best_distance.2);
     // 2. Obtener el ref_name del mejor hit
     let best_ref_name = &best_distance.1;  // Segunda columna de distances
     
