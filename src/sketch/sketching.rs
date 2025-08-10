@@ -276,6 +276,13 @@ pub fn binwise_minhash<P: AsRef<Path>>(
     Ok(signs)
 }
 
+// Esta funcion en realidad este devolviendo ANI en lugar de Jaccard
+/// Calcula el índice de Jaccard entre dos sketches y lo convierte a ANI.
+/// - `sketch1` y `sketch2`: Vectores de hashes mínimos
+/// - `kmer_size`: Tamaño de los k-mers utilizados para el sketch.
+/// - Retorna el índice de Jaccard como un valor entre 0 y 1
+/// - Si el índice de Jaccard es 0, retorna 0.0 (mínima similitud).
+
 
 pub fn jaccard_index(sketch1: &[u64], sketch2: &[u64], kmer_size: usize) -> f64 {
     assert_eq!(sketch1.len(), sketch2.len(), "Sketches deben tener el mismo tamaño.");
@@ -288,17 +295,18 @@ pub fn jaccard_index(sketch1: &[u64], sketch2: &[u64], kmer_size: usize) -> f64 
     let jaccard_value = matches as f64 / sketch1.len() as f64;
 
     if jaccard_value == 0.0 {
-        return 1.0; // Distancia máxima
+        return 0.0; // Minima similitud
+    } else{
+        // Calcular distancia Mash: D = -1/k * ln(2j/(1+j))
+        let mash_distance = -((2.0 * jaccard_value) / (1.0 + jaccard_value)).ln() / kmer_size as f64;
+        
+        // Convertir distancia Mash a ANI
+        let ani = 1.0 - mash_distance;
+
+        // Asegurar que ANI esté en el rango [0, 1]
+        return ani.max(0.0).min(1.0);
     }
 
-      // Calcular distancia Mash: D = -1/k * ln(2j/(1+j))
-    let mash_distance = -((2.0 * jaccard_value) / (1.0 + jaccard_value)).ln() / kmer_size as f64;
-    
-    // Convertir distancia Mash a ANI
-    let ani = 1.0 - mash_distance;
-    
-    // Asegurar que ANI esté en el rango [0, 1]
-    ani.max(0.0).min(1.0)
 }
 /// Compara los sketches de query_manager contra un subconjunto específico de sketches 
 /// en reference_manager, devolviendo solo aquellas comparaciones con distancia < max_dist.

@@ -29,6 +29,9 @@ pub struct UpdateArgs {
     /// Archivo de texto plano con paths a archivos FASTA (uno por línea)
     #[arg(long, required = true, value_name = "FILES_LIST")]
     pub files: String,
+
+    #[arg(long, required= false, value_name = "DEBUG")]
+    pub debug: bool
 }
 
 /// Contexto con la información precargada que necesita todo el flujo `update`
@@ -201,48 +204,48 @@ pub fn update_command(args: &UpdateArgs) -> Result<()> {
     println!("Niveles disponibles: {}", ctx.levels.len());
 
   // Cargar SketchManager desde DuckDB usando UpdateCtx
-let mut sketch_manager_result = load_sketch_manager_from_db(
-    ctx.conn,
-    ctx.kmer_size(),
-    ctx.sketch_size()
-);
+    let mut sketch_manager_result = load_sketch_manager_from_db(
+        ctx.conn,
+        ctx.kmer_size(),
+        ctx.sketch_size()
+    );
 
-match &mut sketch_manager_result {
-    Ok(sketch_manager) => {
-        println!(
-            "✓ SketchManager cargado desde DB. Contiene {} sketches",
-            sketch_manager.length()
-        );
+    match &mut sketch_manager_result {
+        Ok(sketch_manager) => {
+            println!(
+                "✓ SketchManager cargado desde DB. Contiene {} sketches",
+                sketch_manager.length()
+            );
 
-        for line in fs::read_to_string(&args.files)
-            .with_context(|| format!("Error leyendo archivo de lista de archivos: {}", args.files))?
-            .lines()
-        {
-            let fasta_path = Path::new(line.trim());
-            if !fasta_path.exists() {
-                eprintln!("Archivo FASTA no encontrado: {}", fasta_path.display());
-                continue;
+            for line in fs::read_to_string(&args.files)
+                .with_context(|| format!("Error leyendo archivo de lista de archivos: {}", args.files))?
+                .lines()
+            {
+                let fasta_path = Path::new(line.trim());
+                if !fasta_path.exists() {
+                    eprintln!("Archivo FASTA no encontrado: {}", fasta_path.display());
+                    continue;
+                }
+
+                let sample_name = fasta_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                if sketch_manager.contains(&sample_name) {
+                    println!("✓ El sketch para {} ya existe, se omitirá.", sample_name);
+                    continue;
+                }
+
+                update_single_file(fasta_path, &mut ctx, sketch_manager, args.debug)?; // Mut borrow aquí
             }
-
-            let sample_name = fasta_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-
-            if sketch_manager.contains(&sample_name) {
-                println!("✓ El sketch para {} ya existe, se omitirá.", sample_name);
-                continue;
-            }
-
-            update_single_file(fasta_path, &mut ctx, sketch_manager)?; // Mut borrow aquí
         }
-    }
-    Err(ref e) => {
-        // Manejo de error; puedes personalizar según tu flujo
-        eprintln!("Error al cargar SketchManager desde la base de datos: {e}");
-        // return Err(e.clone().into()); // si quieres propagar el error
-    }
+        Err(ref e) => {
+            // Manejo de error; puedes personalizar según tu flujo
+            eprintln!("Error al cargar SketchManager desde la base de datos: {e}");
+            // return Err(e.clone().into()); // si quieres propagar el error
+        }
 }
 
 
@@ -311,6 +314,7 @@ pub fn update_single_file(
     fasta_path: &Path,
     ctx: &mut UpdateCtx,
     _sketch_manager: &mut SketchManager,
+    debug: bool
 ) -> Result<()> {
     // -------- 1. Crear Query (incluye validaciones, sketch y vectores) --------
     let mut query = Query::new(fasta_path, ctx)?;
@@ -354,7 +358,17 @@ pub fn update_single_file(
             &ref_ids,
             ctx.levels[i].1,
         );
-
+        // --- DEBUG: guardar distances si debug == true ---
+        if debug {
+            let tx = ctx.connection_mut().transaction()?;
+            for (q, r, d) in &distances {
+                tx.execute(
+                    "INSERT INTO debug (Source, Target,dist) VALUES (?1, ?2, ?3)",
+                    params![q, r, d],
+                )?;
+            }
+            tx.commit()?;
+        }
         // 3.3 Procesar distancias
         if !distances.is_empty() {
             // 5. Actualizar según best_hit
@@ -409,6 +423,17 @@ pub fn update_single_file(
             &ref_ids,
             ctx.levels[i].1,
         );
+        // --- DEBUG: guardar distances si debug == true ---
+        if debug {
+            let tx = ctx.connection_mut().transaction()?;
+            for (q, r, d) in &distances {
+                tx.execute(
+                    "INSERT INTO debug (Source, Target,dist) VALUES (?1, ?2, ?3)",
+                    params![q, r, d],
+                )?;
+            }
+            tx.commit()?;
+        }
         println!(
             "✓ Distancias calculadas en ALL con límite {} para {} muestras",
             ctx.levels[i].1,
@@ -617,7 +642,7 @@ pub fn retrieve_classifiers(
 
 
 
-/// Encuentra la distancia mínima y devuelve la tupla correspondiente de ref_db.
+/// Encuentra la similitud maxima y devuelve la tupla correspondiente de ref_db.
 /// 
 /// # Argumentos
 /// * `distances` - Vector de tuplas (query_name, ref_name, distance)

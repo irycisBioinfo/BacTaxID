@@ -67,6 +67,24 @@ impl DuckDb {
         Ok(())
     }
 
+    // Tabla de debug para almacenar pares de nodos y distancias
+    /// Crea la tabla `debug` con las columnas `Source`, `Target` y `dist`.
+    /// Esta tabla se utiliza para almacenar pares de nodos y sus distancias.
+    /// La columna `Source` es de tipo VARCHAR, `Target` es de tipo VARCHAR
+    /// y `dist` es de tipo DOUBLE.
+    ///
+    pub fn init_debug_table(&self) -> Result<()> {
+        let schema_sql = "
+            CREATE TABLE IF NOT EXISTS debug (
+                Source VARCHAR ,
+                Target VARCHAR,
+                dist DOUBLE
+            );
+        ";
+        self.conn.execute_batch(schema_sql)?;
+        Ok(())
+    }
+
     /// Crea e inicializa la tabla `levels` con datos basados en el Vec<u64> proporcionado.
     /// Los valores de Level ser�n "L_0", "L_1", ..., "L_N" donde N es el n�mero de elementos.
     /// Los valores de Dist corresponden a los valores del Vec<f64> convertidos a DOUBLE.
@@ -275,6 +293,7 @@ impl DuckDb {
         self.init_code_full_table()?;
         self.init_code_state_table()?;
         self.init_sketches_table()?; 
+        self.init_debug_table()?;
         Ok(())
     }
 
@@ -297,6 +316,7 @@ impl DuckDb {
         self.init_code_full_table()?;
         self.init_code_state_table()?;
         self.init_sketches_table()?;
+        self.init_debug_table()?;
 
         Ok(())
     }
