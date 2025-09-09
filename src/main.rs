@@ -32,14 +32,8 @@ enum Commands {
     },
     /// Actualiza la base de datos existente
     Update(UpdateArgs),  // <- Cambia aquí: usa UpdateArgs directamente
-    /// Clasifica muestras usando la base de datos (por implementar)
-    Classify {
-        #[arg(value_name = "ACRONYM")]
-        acronym: String,
-
-        #[arg(value_name = "FASTA_FILE")]
-        fasta_file: String,
-    },
+    
+    
 }
 
 fn main() -> Result<()> {
@@ -63,14 +57,10 @@ fn main() -> Result<()> {
             update_command(args)
                 .with_context(|| "Error ejecutando update")?;
         }
-        Commands::Classify { acronym, fasta_file } => {
-            println!("Comando classify por implementar");
-            println!("  - Proyecto: {}", acronym);
-            println!("  - Archivo FASTA: {}", fasta_file);
-            println!("Archivos esperados:");
-            println!("  - {}.db", acronym);
-            println!("  - {}_sketches.bin", acronym);
-        }
+       // Commands::Classify { .. } => {
+       //     println!("Comando classify por implementar");
+       //     process::exit(1);
+       // }
     }
 
     Ok(())

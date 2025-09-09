@@ -385,6 +385,19 @@ pub fn update_single_file(
                 query.code[i] = code_val;
                 query.code_full[i] = code_full_val.clone();
 
+                if i > 0 && query.code_full[i].starts_with(query.code_full[i-1].as_str()) == false {
+                    println!("Warning: El code_full del best hit '{}' no es consistente con el nivel anterior '{}' en nivel {}, tratando como no hay candidatos", 
+                        query.code_full[i], query.code_full[i-1], i);
+                    println!("============ref_db============");
+                    println!("{:?}", ref_db);
+                    println!("============distances============");
+                    println!("{:?}", distances);
+                    println!("============best_hit============");
+                    println!("{:?}", bh);
+
+                    panic!("Inconsistencia en code_full entre niveles consecutivos");
+                }
+
                 if is_classifier(
                     &distances,
                     bh.as_ref().unwrap(),
@@ -538,7 +551,8 @@ pub fn retrieve_classifiers(
                     cs.{level_col} as code_state
                 FROM code c
                 JOIN code_full cf ON c.sample = cf.sample  
-                JOIN code_state cs ON c.sample = cs.sample"
+                JOIN code_state cs ON c.sample = cs.sample
+                WHERE cf.{level_col} = ''"
             ),
             Vec::new()
         ),
@@ -571,7 +585,8 @@ pub fn retrieve_classifiers(
                 FROM code c
                 JOIN code_full cf ON c.sample = cf.sample  
                 JOIN code_state cs ON c.sample = cs.sample
-                WHERE cf.{filter_level_col} = ?"  // ← Solo cf.{filter_level_col}
+                WHERE cf.{filter_level_col} = ?
+                AND cf.{level_col} = ''" // ← Solo cf.{filter_level_col}
             ),
             vec![&group as &dyn duckdb::ToSql]
         ),

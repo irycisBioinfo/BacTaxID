@@ -248,13 +248,16 @@ impl DuckDb {
     /// * `toml_path` - Ruta al archivo TOML que contiene la configuraci�n completa
     /// 
     /// # Ejemplo de archivo TOML
-    /// 
+    ///
     /// ```
     /// genus = "Escherichia"
     /// acronym = "EC"
     /// levels = "[0.95,0.98,0.99,0.999,0.9999]"
     /// kmer_size = 21
     /// sketch_size = 1000
+    /// click_size = 8
+    /// click_threshold = 0.8
+    /// reference_size = 100
     /// ```
     /// 
     /// # Funcionalidad
