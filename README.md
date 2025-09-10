@@ -1,6 +1,10 @@
-<img src="https://r2cdn.perplexity.ai/pplx-full-logo-primary-dark%402x.png" style="height:64px;margin-right:32px"/>
-
 # BacTaxID - Fast Bacterial Taxonomy Identification Tool
+
+<div align="center">
+  <img src="images/BacTaxID_Logo.png" alt="BacTaxID Logo" width="400"/>
+  <br/>
+  <em>High-performance bacterial sub-genus classification tool using advanced sketching algorithms</em>
+</div>
 
 ## Overview
 
