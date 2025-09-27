@@ -4,12 +4,12 @@ use petgraph::{
     graph::{Graph, NodeIndex},
     Undirected,
 };
-use duckdb::{Connection, Result, params};
 
-/// Devuelve `Some((nodos, edges))` si hay un clique ≥ `click_size`, o `None` si no lo hay.
-/// * `ids`      – lista de IDs (VARCHAR) a considerar.
-/// * `dist_max` – umbral máximo para la columna `dist`.
-/// * `click_size` – tamaño mínimo del clique buscado.
+use duckdb::{Connection, Result, params};
+/// Returns `Some((nodes, edges))` if there is a clique ≥ `click_size`, or `None` if not.
+/// * `ids`      – list of IDs (VARCHAR) to consider.
+/// * `dist_max` – maximum threshold for the `dist` column.
+/// * `click_size` – minimum size of the clique to be found.
 pub fn exists_clique(
     conn: &Connection,
     ids: &[String],
@@ -20,7 +20,7 @@ pub fn exists_clique(
         return Ok(None);
     }
 
-    /* ---------- 1. Consulta SQL filtrada ---------- */
+    /* ---------- 1. Filtered SQL query ---------- */
     let placeholders = ids
         .iter()
         .map(|_| "?")
@@ -35,7 +35,7 @@ pub fn exists_clique(
         placeholders, placeholders
     );
 
-    /* parámetros: ids para source, ids para target, dist_max */
+    /* parameters: ids for source, ids for target, dist_max */
     let mut params: Vec<&dyn duckdb::ToSql> =
         ids.iter().map(|s| s as &dyn duckdb::ToSql).collect();
     params.extend(ids.iter().map(|s| s as &dyn duckdb::ToSql));
@@ -44,13 +44,13 @@ pub fn exists_clique(
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params.as_slice(), |row| {
         Ok((
-            row.get::<_, i64>(0)?,     // id fila
+            row.get::<_, i64>(0)?,     // row id
             row.get::<_, String>(1)?,  // source
             row.get::<_, String>(2)?,  // target
         ))
     })?;
 
-    /* ---------- 2. Construcción del grafo ---------- */
+    /* ---------- 2. Graph construction ---------- */
     let mut g: Graph<String, i64, Undirected> = Graph::new_undirected();
     let mut id2idx: HashMap<String, NodeIndex> = HashMap::new();
 
@@ -70,14 +70,14 @@ pub fn exists_clique(
         }
     }
 
-    /* ---------- 3. Búsqueda de cliques ---------- */
+    /* ---------- 3. Clique search ---------- */
     for clique in maximal_cliques(&g) {
         if clique.len() >= click_size {
-            /* Recuperar IDs de nodos */
+            /* Retrieve node IDs */
             let mut nodes: Vec<String> = clique.iter().map(|&ix| g[ix].clone()).collect();
             nodes.sort();
 
-            /* Recuperar IDs de edges del clique */
+            /* Retrieve edge IDs from the clique */
             let mut edges = Vec::<i64>::new();
             for i in 0..nodes.len() {
                 for j in (i + 1)..nodes.len() {
@@ -98,17 +98,16 @@ pub fn exists_clique(
     Ok(None)
 }
 
-
-/// Elimina de la tabla 'edges' todas las filas cuyo ID esté en `edge_ids`
-/// y cuya distancia sea menor que `dist_max`.
+/// Deletes from the 'edges' table all rows whose ID is in `edge_ids`
+/// and whose distance is less than `dist_min`.
 ///
-/// # Parámetros:
-/// - `conn`      : Conexión mutable a DuckDB.
-/// - `edge_ids`  : Slice de `i64` con los IDs (primary key) a eliminar.
-/// - `dist_max`  : Distancia minima; solo se eliminan edges con `dist < dist_min`.
+/// # Parameters:
+/// - `conn`: mutable DuckDB connection.
+/// - `edge_ids`: Slice of `i64` IDs (primary key) to delete.
+/// - `dist_min`: Minimum distance; only edges with `dist < dist_min` will be deleted.
 ///
-/// # Retorna:
-/// - `Ok(())` en caso de éxito, o `Err` en caso de error de base de datos.
+/// # Returns:
+/// - `Ok(())` on success, or `Err` on database error.
 pub fn delete_edges_by_ids(
     conn: &mut Connection,
     edge_ids: &[i64],
@@ -120,17 +119,17 @@ pub fn delete_edges_by_ids(
     
     let tx = conn.transaction()?;
     
-    // Crear tabla temporal con nombre único
+    // Create a temporary table with a unique name
     let temp_table = format!("temp_ids_{}", std::process::id());
     tx.execute_batch(&format!("CREATE TEMP TABLE {} (id INTEGER)", temp_table))?;
     
-    // Insertar IDs en la tabla temporal
+    // Insert IDs into the temporary table
     let mut insert_stmt = tx.prepare(&format!("INSERT INTO {} (id) VALUES (?)", temp_table))?;
     for &id in edge_ids {
         insert_stmt.execute(params![id])?;
     }
     
-    // Eliminar solo aquellos edges con id en temp_table y dist < dist_min
+    // Delete only those edges whose id is in temp_table and dist < dist_min
     let deleted = tx.execute(
         &format!(
             "DELETE FROM edges \
@@ -141,18 +140,17 @@ pub fn delete_edges_by_ids(
         params![dist_min],
     )?;
     
-    // Limpiar tabla temporal
+    // Clean up the temporary table
     tx.execute(&format!("DROP TABLE {}", temp_table), [])?;
     
     tx.commit()?;
     
-    println!("✓ Eliminadas {} filas de la tabla edges", deleted);
+    println!("✓ Deleted {} rows from edges table", deleted);
     Ok(())
 }
 
-
-/// Obtiene los edges de `edges` donde source o target está en el slice de node_ids (ambos VARCHAR)
-/// y dist < dist_max. Retorna un vector de (source, target, dist).
+/// Gets edges from `edges` where source or target is in the node_ids slice (both VARCHAR)
+/// and dist < dist_max. Returns a vector of (source, target, dist).
 pub fn get_edges_by_node_ids_and_dist(
     conn: &Connection,
     node_ids: &[&str],
@@ -169,7 +167,7 @@ pub fn get_edges_by_node_ids_and_dist(
         placeholders, placeholders
     );
 
-    // Parametros: node_ids para source, node_ids para target, dist_max
+    // Parameters: node_ids for source, node_ids for target, dist_max
     let mut params: Vec<&dyn duckdb::ToSql> = node_ids.iter().map(|id| id as &dyn duckdb::ToSql).collect();
     params.extend(node_ids.iter().map(|id| id as &dyn duckdb::ToSql));
     params.push(&dist_max);
@@ -191,15 +189,14 @@ pub fn get_edges_by_node_ids_and_dist(
     Ok(result)
 }
 
-
-/// Inserta un vector de edges (source, target, dist) en la tabla edges de DuckDB.
+/// Inserts a vector of edges (source, target, dist) into the DuckDB edges table.
 /// 
-/// # Parámetros
-/// - conn: conexión activa a DuckDB
-/// - edges: slice de tuplas (source, target, dist)
+/// # Parameters
+/// - conn: active DuckDB connection
+/// - edges: slice of tuples (source, target, dist)
 /// 
-/// # Nota
-/// - La tabla debe tener columnas source (VARCHAR), target (VARCHAR), dist (DOUBLE)
+/// # Note
+/// - The table must have columns source (VARCHAR), target (VARCHAR), dist (DOUBLE)
 pub fn insert_edges(
     conn: &Connection,
     edges: &[(String, String, f64)]
@@ -212,4 +209,3 @@ pub fn insert_edges(
     }
     Ok(())
 }
-

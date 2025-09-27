@@ -17,13 +17,13 @@ pub struct MetadataConfig {
     pub reference_size: i32
 }
 
-/// Estructura que encapsula la conexión a DuckDB.
+/// Structure that encapsulates the connection to DuckDB.
 pub struct DuckDb {
     conn: Connection,
 }
 
 impl DuckDb {
-    /// Inicializa una nueva base de datos DuckDB en el archivo especificado.
+    /// Initializes a new DuckDB database in the specified file.
     pub fn new(db_path: &str) -> Result<Self> {
         let conn = Connection::open(db_path)?;
         Ok(DuckDb { conn })
@@ -40,17 +40,17 @@ impl DuckDb {
         Ok(())
     }
 
-    /// Añade un Sketch a la tabla sketches
+    /// Adds a Sketch to the sketches table
     pub fn add_sketch(&self, sample_id: &str, sketch: &Sketch) -> Result<()> {
         insert_sketch_object(&self.conn, sample_id, sketch)
     }
 
-    /// Reconstruye un SketchManager desde la base de datos
+    /// Reconstructs a SketchManager from the database
     pub fn load_sketch_manager(&self, default_kmer_size: usize, default_sketch_size: usize) -> AnyResult<SketchManager> {
         load_sketch_manager_from_db(&self.conn, default_kmer_size, default_sketch_size)
     }
 
-    /// Crea la tabla `edges` con las columnas especificadas si no existe.
+    /// Creates the `edges` table with the specified columns if it does not exist.
     pub fn init_edges_table(&self) -> Result<()> {
         let schema_sql = "
             CREATE SEQUENCE id_sequence START 1;
@@ -65,7 +65,7 @@ impl DuckDb {
         Ok(())
     }
 
-    /// Crea la tabla `debug` con las columnas `Source`, `Target` y `dist`.
+    /// Creates the `debug` table with the columns `Source`, `Target`, and `dist`.
     pub fn init_debug_table(&self) -> Result<()> {
         let schema_sql = "
             CREATE TABLE IF NOT EXISTS debug (
@@ -78,9 +78,9 @@ impl DuckDb {
         Ok(())
     }
 
-    /// Crea e inicializa la tabla `levels` con datos basados en el Vec<f64> proporcionado.
+    /// Creates and initializes the `levels` table with data based on the provided Vec<f64>.
     pub fn init_levels_table(&self, distances: Vec<f64>) -> Result<()> {
-        // Crear la tabla si no existe
+        // Create the table if it does not exist
         let create_table_sql = "
             CREATE TABLE IF NOT EXISTS levels (
                 level VARCHAR,
@@ -89,58 +89,53 @@ impl DuckDb {
         ";
         self.conn.execute_batch(create_table_sql)?;
 
-        // Limpiar la tabla existente
+        // Clean the existing table
         self.conn.execute("DELETE FROM levels", [])?;
 
-        // Preparar la declaración de inserción
+        // Prepare the insert statement
         let mut stmt = self.conn.prepare("INSERT INTO levels (level, dist) VALUES (?, ?)")?;
 
-        // Iterar sobre el vector e insertar cada elemento
+        // Iterate over the vector and insert each element
         for (index, &distance) in distances.iter().enumerate() {
             let level_name = format!("L_{}", index);
             let dist_value = distance as f64;
-            
             stmt.execute([&level_name, &dist_value.to_string()])?;
         }
-
         Ok(())
     }
 
-    /// Crea dinámicamente la tabla `code` fusionada basada en los niveles existentes en la tabla `levels`.
-    /// La tabla tendrá una columna `sample` (VARCHAR, Primary Key) y para cada nivel L_X:
-    /// - L_X_int (INTEGER) - equivalente a la antigua tabla code
-    /// - L_X_full (VARCHAR) - equivalente a la antigua tabla code_full  
-    /// - L_X_state (VARCHAR) - equivalente a la antigua tabla code_state
+    /// Dynamically creates the merged `code` table based on the existing levels in the `levels` table.
+    /// The table will have a `sample` column (VARCHAR, Primary Key) and for each level L_X:
+    /// - L_X_int (INTEGER) - equivalent to the old code table
+    /// - L_X_full (VARCHAR) - equivalent to the old code_full table
+    /// - L_X_state (VARCHAR) - equivalent to the old code_state table
     pub fn init_code_table(&self) -> Result<()> {
-        // Obtener los nombres de los niveles desde la tabla levels
+        // Get the names of the levels from the levels table
         let mut stmt = self.conn.prepare("SELECT level FROM levels ORDER BY level")?;
         let mut rows = stmt.query([])?;
-        
+
         let mut level_columns = Vec::new();
         while let Some(row) = rows.next()? {
             let level_name: String = row.get(0)?;
             level_columns.push(level_name);
         }
 
-        // Construir la SQL para crear la tabla dinámicamente
+        // Build the SQL to create the table dynamically
         let mut create_table_sql = String::from("CREATE TABLE IF NOT EXISTS code (\n    sample VARCHAR PRIMARY KEY");
-        
-        // Agregar columnas L_X_int, L_X_full, L_X_state para cada nivel
+        // Add L_X_int, L_X_full, L_X_state columns for each level
         for level_name in &level_columns {
             create_table_sql.push_str(&format!(",\n    {}_int INTEGER", level_name));
             create_table_sql.push_str(&format!(",\n    {}_full VARCHAR", level_name));
             create_table_sql.push_str(&format!(",\n    {}_state VARCHAR", level_name));
         }
-        
         create_table_sql.push_str("\n);");
 
-        // Ejecutar la creación de la tabla
+        // Execute the table creation
         self.conn.execute_batch(&create_table_sql)?;
-        
         Ok(())
     }
 
-    /// Crea la tabla `metadata` con información sobre el experimento.
+    /// Creates the `metadata` table with information about the experiment.
     pub fn init_metadata_table(&self) -> Result<()> {
         let schema_sql = "
             CREATE TABLE IF NOT EXISTS metadata (
@@ -159,68 +154,68 @@ impl DuckDb {
     }
 
     pub fn create_from_toml(toml_path: &str) -> Result<Self> {
-        // 1. Leer y deserializar el archivo TOML primero para obtener el genus
+        // 1. Read and deserialize the TOML file first to get the genus
         let toml_content = fs::read_to_string(toml_path)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
 
         let config: MetadataConfig = toml::from_str(&toml_content)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(e.to_string().into()))?;
 
-        // 2. Generar el nombre de la base de datos basado en el genus
+        // 2. Generate the database name based on the genus
         let db_name = format!("{}_bactaxid.db", config.acronym);
-        
-        // 3. Crear una nueva instancia de DuckDb con el nombre generado
+
+        // 3. Create a new instance of DuckDb with the generated name
         let db = Self::new(&db_name)?;
 
-        // 4. Inicializar todas las tablas usando los datos del TOML
+        // 4. Initialize all tables using the TOML data
         db.init_all_tables_from_config(&config)?;
 
         Ok(db)
     }
 
-    /// Función principal que inicializa toda la base de datos desde un archivo TOML.
+    /// Main function that initializes the entire database from a TOML file.
     pub fn init_database_from_toml(&self, toml_path: &str) -> Result<()> {
-        // 1. Leer y deserializar el archivo TOML
+        // 1. Read and deserialize the TOML file
         let toml_content = fs::read_to_string(toml_path)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
 
         let config: MetadataConfig = toml::from_str(&toml_content)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(e.to_string().into()))?;
 
-        // 2. Parsear el campo levels usando función asociada
+        // 2. Parse the levels field using an associated function
         let levels_vec = Self::parse_levels_string(&config.levels)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(e.into()))?;
         println!("Parsed levels: {:?}", levels_vec);
 
-        // 4. Inicializar tabla metadata
+        // 4. Initialize metadata table
         self.init_metadata_table()?;
         self.insert_metadata_from_config(&config)?;
 
-        // 5. Inicializar tabla levels
+        // 5. Initialize levels table
         self.init_levels_table(levels_vec)?;
 
-        // 6. Inicializar todas las demás tablas
+        // 6. Initialize all other tables
         self.init_edges_table()?;
         self.init_code_table()?;
-        self.init_sketches_table()?; 
+        self.init_sketches_table()?;
         self.init_debug_table()?;
         Ok(())
     }
 
     pub fn init_all_tables_from_config(&self, config: &MetadataConfig) -> Result<()> {
-        // 2. Parsear el campo levels usando función asociada
+        // 2. Parse the levels field using the associated function
         let levels_vec = Self::parse_levels_string(&config.levels)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(e.into()))?;
         println!("Parsed levels: {:?}", levels_vec);
 
-        // 4. Inicializar tabla metadata
+        // 4. Initialize metadata table
         self.init_metadata_table()?;
         self.insert_metadata_from_config(config)?;
 
-        // 5. Inicializar tabla levels
+        // 5. Initialize levels table
         self.init_levels_table(levels_vec)?;
 
-        // 6. Inicializar todas las demás tablas
+        // 6. Initialize all other tables
         self.init_edges_table()?;
         self.init_code_table()?;
         self.init_sketches_table()?;
@@ -229,32 +224,30 @@ impl DuckDb {
         Ok(())
     }
 
-    /// Función auxiliar para parsear el string de levels a Vec<f64>
+    /// Helper function to parse the levels string into Vec<f64>
     fn parse_levels_string(levels_str: &str) -> AnyResult<Vec<f64>> {
-        // Remover corchetes y espacios
+        // Remove brackets and spaces
         let cleaned = levels_str
             .trim()
             .strip_prefix('[')
             .and_then(|s| s.strip_suffix(']'))
-            .context("El string de levels debe estar entre corchetes []")?;
+            .context("The levels string must be enclosed in brackets []")?;
 
-        // Dividir por comas y parsear cada valor
+        // Split by commas and parse each value
         let levels: AnyResult<Vec<f64>> = cleaned
             .split(',')
             .map(|s| {
                 let value = s.trim().parse::<f64>()
-                    .with_context(|| format!("Error parseando el valor '{}'", s.trim()))?;
-                
-                // Validación: asegurar que esté entre 0 y 1
+                    .with_context(|| format!("Error parsing value '{}'", s.trim()))?;
+                // Validation: ensure it is between 0 and 1
                 if value < 0.0 || value > 1.0 {
-                    bail!("Valor fuera del rango [0,1]: {}", value);
+                    bail!("Value out of range [0,1]: {}", value);
                 }
-                
                 Ok(value)
             })
             .collect();
 
-        levels.context("Error procesando los valores de levels")
+        levels.context("Error processing levels values")
     }
 
     fn insert_metadata_from_config(&self, config: &MetadataConfig) -> Result<()> {
@@ -262,7 +255,7 @@ impl DuckDb {
             genus, acronym, levels, kmer_size, sketch_size, click_size, click_threshold, reference_size
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
 
-        // Imprime la consulta y los parámetros para debug
+        // Print the query and parameters for debugging
         println!(
             "SQL: {}\nParams: genus={:?}, acronym={:?}, levels={:?}, kmer_size={:?}, sketch_size={:?}, click_size={:?}, click_threshold={:?}, reference_size={:?}",
             sql,
@@ -291,32 +284,32 @@ impl DuckDb {
         Ok(())
     }
 
-    /// Lee un archivo TOML y inserta los datos en la tabla metadata.
+    /// Reads a TOML file and inserts the data into the metadata table.
     pub fn load_metadata_from_toml(&self, toml_path: &str) -> Result<()> {
-        // Leer el archivo TOML
+        // Read the TOML file
         let toml_content = fs::read_to_string(toml_path)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
 
-        // Deserializar el contenido TOML
+        // Deserialize the TOML content
         let config: MetadataConfig = toml::from_str(&toml_content)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(e.to_string().into()))?;
 
-        // Insertar datos usando la función auxiliar
+        // Insert data using the helper function
         self.insert_metadata_from_config(&config)?;
 
         Ok(())
     }
 
-    /// Acceso a la conexión interna, si se requiere para operaciones avanzadas.
+    /// Access to the internal connection, if required for advanced operations.
     pub fn connection(&self) -> &Connection {
         &self.conn
     }
 }
 
-/// Inserta una fila en la tabla code fusionada
-/// con el campo sample igual a `sample_id` y el resto de columnas como NULL.
+/// Inserts a row in the merged code table
+/// with the sample field equal to `sample_id` and the rest of the columns as NULL.
 pub fn insert_empty_code(conn: &Connection, sample_id: &str) -> Result<()> {
-    // Obtiene todas las columnas menos la primaria (sample)
+    // Get all columns except the primary (sample)
     let mut stmt = conn.prepare(
         "SELECT column_name FROM information_schema.columns \
          WHERE table_name = 'code' AND column_name != 'sample' ORDER BY ordinal_position"
@@ -326,7 +319,7 @@ pub fn insert_empty_code(conn: &Connection, sample_id: &str) -> Result<()> {
         .collect();
     let n = columns.len();
 
-    // Construye el SQL: INSERT INTO code (sample, col1, col2, ...) VALUES (?, NULL, NULL, ...)
+    // Build the SQL: INSERT INTO code (sample, col1, col2, ...) VALUES (?, NULL, NULL, ...)
     let columns_sql = if n > 0 {
         format!(", {}", columns.join(", "))
     } else { "".to_string() };
@@ -338,17 +331,16 @@ pub fn insert_empty_code(conn: &Connection, sample_id: &str) -> Result<()> {
         columns=columns_sql,
         nulls=if n>0 { format!(", {nulls}") } else { "".to_string() },
     );
-    
     conn.execute(&sql, params![sample_id])?;
     Ok(())
 }
 
-/// Copia campos L_X_int desde ref_id a input_id hasta el nivel l (inclusive)
+/// Copies L_X_int fields from ref_id to input_id up to level l (inclusive)
 pub fn copy_code_l_fields_up_to(conn: &Connection, input_id: &str, ref_id: &str, l: usize) -> Result<()> {
-    // Genera lista de columnas L_0_int a L_L_int
+    // Generate list of columns L_0_int to L_L_int
     let columns: Vec<String> = (0..=l).map(|i| format!("L_{}_int", i)).collect();
-    
-    // Construye SQL UPDATE
+
+    // Build UPDATE SQL
     let mut set_expr = String::new();
     for (i, col) in columns.iter().enumerate() {
         if i > 0 {
@@ -362,23 +354,23 @@ pub fn copy_code_l_fields_up_to(conn: &Connection, input_id: &str, ref_id: &str,
         set_expr = set_expr
     );
 
-    // Recupera los valores de ref_id
+    // Retrieve values from ref_id
     let select_sql = format!(
         "SELECT {} FROM code WHERE sample = ?",
         columns.join(",")
     );
-    
+
     let mut stmt = conn.prepare(&select_sql)?;
     let values_row = stmt.query_row([ref_id], |row| {
         (0..=l).map(|i| row.get::<_, Option<i32>>(i)).collect::<Result<Vec<_>, _>>()
     })?;
 
-    // Haz el UPDATE usando params_from_iter
+    // Perform UPDATE using params_from_iter
     if values_row.len() == l + 1 {
-        // Crear vector de parámetros
+        // Create parameter vector
         let mut params: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
-        
-        // Agregar todos los valores L_0_int..L_L_int
+
+        // Add all L_0_int..L_L_int values
         for value in values_row {
             if let Some(v) = value {
                 params.push(Box::new(v));
@@ -386,28 +378,27 @@ pub fn copy_code_l_fields_up_to(conn: &Connection, input_id: &str, ref_id: &str,
                 params.push(Box::new(None::<i32>));
             }
         }
-        
-        // Agregar el input_id al final
+
+        // Add input_id at the end
         params.push(Box::new(input_id.to_string()));
 
-        // Usar params_from_iter para ejecutar
+        // Execute using params_from_iter
         let mut stmt2 = conn.prepare(&sql)?;
         stmt2.execute(params_from_iter(params))?;
-        
         Ok(())
     } else {
         Err(duckdb::Error::ToSqlConversionFailure(
-            format!("No se obtuvieron L_0_int..L_{}_int para sample '{}'", l, ref_id).into()
+            format!("Did not obtain L_0_int..L_{}_int for sample '{}'", l, ref_id).into()
         ))      
     }
 }
 
-/// Copia campos L_X_full desde ref_id a input_id hasta el nivel l (inclusive)
+/// Copies L_X_full fields from ref_id to input_id up to level l (inclusive)
 pub fn copy_code_full_l_fields_up_to(conn: &Connection, input_id: &str, ref_id: &str, l: usize) -> Result<()> {
-    // Genera lista de columnas L_0_full a L_L_full
+    // Generate list of columns L_0_full to L_L_full
     let columns: Vec<String> = (0..=l).map(|i| format!("L_{}_full", i)).collect();
-    
-    // Construye SQL UPDATE
+
+    // Build UPDATE SQL
     let mut set_expr = String::new();
     for (i, col) in columns.iter().enumerate() {
         if i > 0 {
@@ -421,23 +412,23 @@ pub fn copy_code_full_l_fields_up_to(conn: &Connection, input_id: &str, ref_id: 
         set_expr = set_expr
     );
 
-    // Recupera los valores de ref_id
+    // Retrieve values from ref_id
     let select_sql = format!(
         "SELECT {} FROM code WHERE sample = ?",
         columns.join(",")
     );
-    
+
     let mut stmt = conn.prepare(&select_sql)?;
     let values_row = stmt.query_row([ref_id], |row| {
         (0..=l).map(|i| row.get::<_, Option<String>>(i)).collect::<Result<Vec<_>, _>>()
     })?;
 
-    // Haz el UPDATE usando params_from_iter
+    // Perform UPDATE using params_from_iter
     if values_row.len() == l + 1 {
-        // Crear vector de parámetros
+        // Create parameter vector
         let mut params: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
-        
-        // Agregar todos los valores L_0_full..L_L_full
+
+        // Add all L_0_full..L_L_full values
         for value in values_row {
             if let Some(v) = value {
                 params.push(Box::new(v));
@@ -445,23 +436,22 @@ pub fn copy_code_full_l_fields_up_to(conn: &Connection, input_id: &str, ref_id: 
                 params.push(Box::new(None::<String>));
             }
         }
-        
-        // Agregar el input_id al final
+
+        // Add input_id at the end
         params.push(Box::new(input_id.to_string()));
 
-        // Usar params_from_iter para ejecutar
+        // Execute using params_from_iter
         let mut stmt2 = conn.prepare(&sql)?;
         stmt2.execute(params_from_iter(params))?;
-        
         Ok(())
     } else {
         Err(duckdb::Error::ToSqlConversionFailure(
-            format!("No se obtuvieron L_0_full..L_{}_full para sample '{}'", l, ref_id).into()
+            format!("Did not obtain L_0_full..L_{}_full for sample '{}'", l, ref_id).into()
         ))      
     }
 }
 
-/// Inserta un objeto Sketch serializado en la tabla sketches
+/// Inserts a serialized Sketch object into the sketches table
 pub fn insert_sketch_object(
     conn: &Connection,
     sample_id: &str,
@@ -469,13 +459,13 @@ pub fn insert_sketch_object(
 ) -> Result<()> {
     let serialized = bincode::serialize(sketch)
         .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
-    
+
     let mut stmt = conn.prepare("INSERT INTO sketches (sample, sketch) VALUES (?, ?)")?;
     stmt.execute(params![sample_id, serialized])?;
     Ok(())
 }
 
-/// Obtiene todos los objetos Sketch de la tabla (para reconstruir SketchManager)
+/// Gets all Sketch objects from the table (to reconstruct SketchManager)
 pub fn get_all_sketch_objects(conn: &Connection) -> Result<Vec<(String, Sketch)>> {
     let mut stmt = conn.prepare("SELECT sample, sketch FROM sketches")?;
     let rows = stmt.query_map([], |row| {
@@ -494,7 +484,7 @@ pub fn get_all_sketch_objects(conn: &Connection) -> Result<Vec<(String, Sketch)>
     Ok(sketches)
 }
 
-// Al final de tu archivo duckdb.rs
+// At the end of your duckdb.rs file
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,35 +493,35 @@ mod tests {
 
     #[test]
     fn test_metadata_table_initialization() {
-        // ... código existente
+        // ... existing code ...
     }
 
     #[test]
     fn test_sketches_table_initialization() {
-        let db = DuckDb::new(":memory:").expect("No se pudo crear la base de datos");
-        db.init_sketches_table().expect("No se pudo crear la tabla sketches");
+        let db = DuckDb::new(":memory:").expect("Could not create database");
+        db.init_sketches_table().expect("Could not create sketches table");
 
-        // Verificar que la tabla sketches se creó correctamente
+        // Check that the sketches table was created correctly
         let columns_check = "SELECT column_name FROM information_schema.columns WHERE table_name = 'sketches' ORDER BY ordinal_position";
-        let mut stmt = db.conn.prepare(columns_check).expect("Error preparando consulta");
-        let mut rows = stmt.query([]).expect("Error ejecutando consulta");
-        
+        let mut stmt = db.conn.prepare(columns_check).expect("Error preparing query");
+        let mut rows = stmt.query([]).expect("Error running query");
+
         let mut columns = Vec::new();
-        while let Some(row) = rows.next().expect("Error leyendo fila") {
-            let column_name: String = row.get(0).expect("Error obteniendo column_name");
+        while let Some(row) = rows.next().expect("Error reading row") {
+            let column_name: String = row.get(0).expect("Error getting column_name");
             columns.push(column_name);
         }
-        
+
         assert_eq!(columns, vec!["sample", "sketch"]);
     }
 
     #[test]
     fn test_insert_and_retrieve_sketch_object() {
-        // ... test code
+        // ... test code ...
     }
 
     #[test]
     fn test_load_sketch_manager_from_db() {
-        // ... test code
+        // ... test code ...
     }
 }
