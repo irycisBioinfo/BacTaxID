@@ -1,3 +1,4 @@
+
 use clap::{Parser, Subcommand};
 use std::process;
 use anyhow::{Context, Result};
@@ -9,6 +10,7 @@ mod commands;
 
 use commands::{init_command, update_command, verify_init_files};
 use commands::update::UpdateArgs;
+use commands::classify::ClassifyArgs;  // Añadir import de ClassifyArgs
 
 #[derive(Parser)]
 #[command(name = "bactaxid")]
@@ -31,8 +33,9 @@ enum Commands {
         verify: bool,
     },
     /// Updates the existing database
-    Update(UpdateArgs),  // <- Change here: use UpdateArgs directly
-    
+    Update(UpdateArgs),
+    /// Classifies sequences against the reference database (read-only)
+    Classify(ClassifyArgs),  // Añadir comando Classify
 }
 
 fn main() -> Result<()> {
@@ -52,14 +55,15 @@ fn main() -> Result<()> {
             }
         }
         Commands::Update(args) => {
-            // Call your update_command function passing args
             update_command(args)
                 .with_context(|| "Error running update")?;
         }
-       // Commands::Classify { .. } => {
-       //     println!("Classify command not implemented");
-       //     process::exit(1);
-       // }
+        Commands::Classify(args) => {
+            // Importar la función classify_command desde el módulo commands::classify
+            use commands::classify::classify_command;
+            classify_command(args)
+                .with_context(|| "Error running classify")?;
+        }
     }
 
     Ok(())
