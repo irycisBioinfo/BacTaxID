@@ -76,7 +76,16 @@ impl<'a> DistanceCtx<'a> {
 pub struct PairwiseDistance {
     pub sample1: String,
     pub sample2: String,
+    pub signature1: u64,
+    pub signature2: u64,
     pub ani: f64,
+}
+
+/// Structure to hold sample mapping
+#[derive(Debug, Clone)]
+struct SampleInfo {
+    sample: String,
+    signature: u64,
 }
 
 /// Load metadata from database into HashMap
@@ -152,20 +161,26 @@ fn read_sample_ids(ids_file: &str) -> Result<Vec<String>> {
     Ok(ids)
 }
 
-/// Verify that all sample IDs exist in the database
-fn verify_samples_exist(conn: &Connection, ids: &[String]) -> Result<()> {
+/// Verify samples exist and get their signatures
+fn verify_and_get_sample_info(conn: &Connection, ids: &[String]) -> Result<Vec<SampleInfo>> {
     let start = Instant::now();
+    let mut sample_infos = Vec::new();
     let mut missing_ids = Vec::new();
     
     for id in ids {
-        let exists: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM sketches WHERE sample = ?",
+        let result: Option<(String, u64)> = conn.query_row(
+            "SELECT sample, signature FROM sketches WHERE sample = ?",
             [id],
-            |row| row.get(0)
-        )?;
+            |row| Ok((row.get(0)?, row.get(1)?))
+        ).ok();
         
-        if !exists {
-            missing_ids.push(id.clone());
+        match result {
+            Some((sample, signature)) => {
+                sample_infos.push(SampleInfo { sample, signature });
+            }
+            None => {
+                missing_ids.push(id.clone());
+            }
         }
     }
     
@@ -181,46 +196,48 @@ fn verify_samples_exist(conn: &Connection, ids: &[String]) -> Result<()> {
     println!("✓ Verified all {} samples exist in database [{:.2}ms]",
              ids.len(), duration.as_millis());
     
-    Ok(())
+    Ok(sample_infos)
 }
 
-/// Calculate pairwise distances in long format with optional threshold
+/// ✅ MODIFICADO: Calculate pairwise distances using signatures internally
 fn calculate_pairwise_distances_long(
     sketch_manager: &SketchManager,
-    ids: &[String],
+    sample_infos: &[SampleInfo],
     threshold: Option<f64>,
     threads: usize,
     verbose: bool,
 ) -> anyhow::Result<Vec<PairwiseDistance>> {
-    let n = ids.len();
+    let n = sample_infos.len();
 
-    // Configurar pool con num_threads y anotar tipo de retorno explícito
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
         .context("Error configuring thread pool")?;
 
     let distances: Vec<PairwiseDistance> = pool.install(|| {
-        // Anotar tipo en collect para evitar E0283
         (0..n)
             .into_par_iter()
             .flat_map(|i| {
-                // También podemos anotar el vector intermedio
                 let mut results: Vec<PairwiseDistance> = Vec::new();
+                
+                // ✅ MODIFICADO: usar get_sketch con signature
                 let sketch_i = sketch_manager
-                    .get_sketch(&ids[i])
+                    .get_sketch(sample_infos[i].signature)
                     .expect("Sketch not found");
 
                 for j in (i + 1)..n {
+                    // ✅ MODIFICADO: usar get_sketch con signature
                     let sketch_j = sketch_manager
-                        .get_sketch(&ids[j])
+                        .get_sketch(sample_infos[j].signature)
                         .expect("Sketch not found");
                     let ani = sketch_i.distance(sketch_j);
 
                     if threshold.map_or(true, |thr| ani >= thr) {
                         results.push(PairwiseDistance {
-                            sample1: ids[i].clone(),
-                            sample2: ids[j].clone(),
+                            sample1: sample_infos[i].sample.clone(),
+                            sample2: sample_infos[j].sample.clone(),
+                            signature1: sample_infos[i].signature,
+                            signature2: sample_infos[j].signature,
                             ani,
                         });
                     }
@@ -232,45 +249,44 @@ fn calculate_pairwise_distances_long(
 
                 results
             })
-            .collect::<Vec<PairwiseDistance>>() // <- clave: anotar tipo aquí
+            .collect::<Vec<PairwiseDistance>>()
     });
 
     Ok(distances)
 }
 
-
-/// Calculate pairwise distances as full matrix (for PHYLIP format)
+/// ✅ MODIFICADO: Calculate pairwise distances matrix using signatures
 fn calculate_pairwise_distances_matrix(
     sketch_manager: &SketchManager,
-    ids: &[String],
+    sample_infos: &[SampleInfo],
     threads: usize,
     verbose: bool,
 ) -> anyhow::Result<Vec<Vec<f64>>> {
-    let n = ids.len();
+    let n = sample_infos.len();
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
         .context("Error configuring thread pool")?;
 
-    // Tipo explícito del valor devuelto por install
     let mut matrix: Vec<Vec<f64>> = pool.install(|| {
         (0..n)
             .into_par_iter()
             .map(|i| {
                 let mut row = vec![0.0f64; n];
 
-                // Obtener referencias inmutables locales (no capturar nada no Send)
+                // ✅ MODIFICADO: usar get_sketch con signature
                 let sketch_i = sketch_manager
-                    .get_sketch(&ids[i])
+                    .get_sketch(sample_infos[i].signature)
                     .expect("Sketch not found");
 
                 for j in 0..n {
                     if i == j {
                         row[j] = 1.0;
                     } else if i < j {
+                        // ✅ MODIFICADO: usar get_sketch con signature
                         let sketch_j = sketch_manager
-                            .get_sketch(&ids[j])
+                            .get_sketch(sample_infos[j].signature)
                             .expect("Sketch not found");
                         row[j] = sketch_i.distance(sketch_j);
                     }
@@ -282,7 +298,7 @@ fn calculate_pairwise_distances_matrix(
 
                 row
             })
-            .collect::<Vec<Vec<f64>>>() // <- anotar tipo de collect
+            .collect::<Vec<Vec<f64>>>()
     });
 
     // Simetrizar el triángulo inferior
@@ -366,7 +382,7 @@ fn save_distances_csv_long(
 /// Save distance matrix in PHYLIP format
 fn save_matrix_phylip(
     output_file: &str,
-    ids: &[String],
+    sample_infos: &[SampleInfo],
     matrix: &[Vec<f64>],
 ) -> Result<()> {
     let start = Instant::now();
@@ -374,20 +390,15 @@ fn save_matrix_phylip(
         .with_context(|| format!("Error creating output file: {}", output_file))?;
     let mut writer = BufWriter::new(file);
     
-    let n = ids.len();
+    let n = sample_infos.len();
     
     // Write header (number of taxa)
     writeln!(writer, "{}", n)?;
     
     // Write matrix rows
-    // PHYLIP format: first 10 characters for name, then distances
     for (i, row) in matrix.iter().enumerate() {
-        let name = if ids[i].len() > 10 {
-            &ids[i][..10]
-        } else {
-            &ids[i]
-        };
-        write!(writer, "{:<10}", name)?;
+        // Escribir el nombre completo de la muestra (sin truncar)
+        write!(writer, "{}", sample_infos[i].sample)?;
         
         for &value in row {
             // Convert ANI to distance (1 - ANI)
@@ -401,6 +412,8 @@ fn save_matrix_phylip(
     
     let duration = start.elapsed();
     println!("✓ Distance matrix saved as PHYLIP [{:.2}ms]", duration.as_millis());
+    println!("  Note: Sample names are not truncated. Some phylogenetic programs may require");
+    println!("        names to be <= 10 characters. Consider using shorter sample IDs if needed.");
     
     Ok(())
 }
@@ -556,8 +569,8 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
     // Read sample IDs
     let ids = read_sample_ids(&args.ids)?;
     
-    // Verify all samples exist in database
-    verify_samples_exist(&conn, &ids)?;
+    // Verify samples exist and get their info (sample + signature)
+    let sample_infos = verify_and_get_sample_info(&conn, &ids)?;
     
     // Load SketchManager from database
     let sketch_load_start = Instant::now();
@@ -571,16 +584,19 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
              sketch_manager.length(),
              sketch_load_start.elapsed().as_secs_f32());
     
-    // Verify all requested samples are in SketchManager
-    let missing_sketches: Vec<&String> = ids.iter()
-        .filter(|id| !sketch_manager.contains(id))
+    // ✅ MODIFICADO: Verify all requested signatures are in SketchManager
+    let missing_sketches: Vec<&SampleInfo> = sample_infos.iter()
+        .filter(|info| !sketch_manager.contains(info.signature))
         .collect();
     
     if !missing_sketches.is_empty() {
         return Err(anyhow!(
             "The following {} samples have no sketches in the database: {}",
             missing_sketches.len(),
-            missing_sketches.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            missing_sketches.iter()
+                .map(|info| info.sample.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     
@@ -589,7 +605,7 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
         "tsv" => {
             let distances = calculate_pairwise_distances_long(
                 &sketch_manager,
-                &ids,
+                &sample_infos,
                 args.threshold,
                 args.threads,
                 args.verbose
@@ -605,7 +621,7 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
         "csv" => {
             let distances = calculate_pairwise_distances_long(
                 &sketch_manager,
-                &ids,
+                &sample_infos,
                 args.threshold,
                 args.threads,
                 args.verbose
@@ -622,7 +638,7 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
             // PHYLIP requires full matrix, threshold is not applied
             let matrix = calculate_pairwise_distances_matrix(
                 &sketch_manager,
-                &ids,
+                &sample_infos,
                 args.threads,
                 args.verbose
             )?;
@@ -631,7 +647,7 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
                 stats.print();
             }
             
-            save_matrix_phylip(&args.output, &ids, &matrix)?;
+            save_matrix_phylip(&args.output, &sample_infos, &matrix)?;
         }
         
         _ => unreachable!(), // Already validated
