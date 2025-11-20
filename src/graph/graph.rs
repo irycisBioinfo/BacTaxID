@@ -6,17 +6,16 @@ use petgraph::{
 };
 
 use duckdb::{Connection, Result, params};
-
-/// ✅ MODIFICADO: Returns `Some((nodes, edges))` if there is a clique ≥ `click_size`, or `None` if not.
-/// * `ids`      – list of signatures (u64) to consider.
+/// Returns `Some((nodes, edges))` if there is a clique ≥ `click_size`, or `None` if not.
+/// * `ids`      – list of IDs (VARCHAR) to consider.
 /// * `dist_max` – maximum threshold for the `dist` column.
 /// * `click_size` – minimum size of the clique to be found.
 pub fn exists_clique(
     conn: &Connection,
-    ids: &[u64],  // ✅ MODIFICADO: &[u64] en lugar de &[String]
+    ids: &[String],
     dist_max: f64,
     click_size: usize,
-) -> Result<Option<(Vec<u64>, Vec<i64>)>> {  // ✅ MODIFICADO: retorna Vec<u64>
+) -> Result<Option<(Vec<String>, Vec<i64>)>> {
     if ids.is_empty() || click_size == 0 {
         return Ok(None);
     }
@@ -46,27 +45,27 @@ pub fn exists_clique(
     let rows = stmt.query_map(params.as_slice(), |row| {
         Ok((
             row.get::<_, i64>(0)?,     // row id
-            row.get::<_, u64>(1)?,     // ✅ MODIFICADO: source como u64
-            row.get::<_, u64>(2)?,     // ✅ MODIFICADO: target como u64
+            row.get::<_, String>(1)?,  // source
+            row.get::<_, String>(2)?,  // target
         ))
     })?;
 
     /* ---------- 2. Graph construction ---------- */
-    let mut g: Graph<u64, i64, Undirected> = Graph::new_undirected();  // ✅ MODIFICADO: Graph<u64, ...>
-    let mut id2idx: HashMap<u64, NodeIndex> = HashMap::new();  // ✅ MODIFICADO: HashMap<u64, ...>
+    let mut g: Graph<String, i64, Undirected> = Graph::new_undirected();
+    let mut id2idx: HashMap<String, NodeIndex> = HashMap::new();
 
-    for &id in ids {  // ✅ MODIFICADO: &id en lugar de id
-        let n = g.add_node(id);
-        id2idx.insert(id, n);
+    for id in ids {
+        let n = g.add_node(id.clone());
+        id2idx.insert(id.clone(), n);
     }
 
-    let mut edge_lookup: HashMap<(u64, u64), i64> = HashMap::new();  // ✅ MODIFICADO: (u64, u64)
+    let mut edge_lookup: HashMap<(String, String), i64> = HashMap::new();
 
     for row in rows.flatten() {
         let (edge_id, s, t) = row;
         if let (Some(&a), Some(&b)) = (id2idx.get(&s), id2idx.get(&t)) {
             g.update_edge(a, b, edge_id);
-            let key = if s <= t { (s, t) } else { (t, s) };  // ✅ MODIFICADO: sin .clone()
+            let key = if s <= t { (s.clone(), t) } else { (t, s) };
             edge_lookup.insert(key, edge_id);
         }
     }
@@ -75,7 +74,7 @@ pub fn exists_clique(
     for clique in maximal_cliques(&g) {
         if clique.len() >= click_size {
             /* Retrieve node IDs */
-            let mut nodes: Vec<u64> = clique.iter().map(|&ix| g[ix]).collect();  // ✅ MODIFICADO: Vec<u64>, sin .clone()
+            let mut nodes: Vec<String> = clique.iter().map(|&ix| g[ix].clone()).collect();
             nodes.sort();
 
             /* Retrieve edge IDs from the clique */
@@ -83,9 +82,9 @@ pub fn exists_clique(
             for i in 0..nodes.len() {
                 for j in (i + 1)..nodes.len() {
                     let key = if nodes[i] <= nodes[j] {
-                        (nodes[i], nodes[j])  // ✅ MODIFICADO: sin .clone()
+                        (nodes[i].clone(), nodes[j].clone())
                     } else {
-                        (nodes[j], nodes[i])  // ✅ MODIFICADO: sin .clone()
+                        (nodes[j].clone(), nodes[i].clone())
                     };
                     if let Some(&eid) = edge_lookup.get(&key) {
                         edges.push(eid);
@@ -150,17 +149,16 @@ pub fn delete_edges_by_ids(
     Ok(())
 }
 
-/// ✅ MODIFICADO: Gets edges from `edges` where source or target is in the node_ids slice (both UBIGINT)
+/// Gets edges from `edges` where source or target is in the node_ids slice (both VARCHAR)
 /// and dist < dist_max. Returns a vector of (source, target, dist).
 pub fn get_edges_by_node_ids_and_dist(
     conn: &Connection,
-    node_ids: &[u64],  // ✅ MODIFICADO: &[u64] en lugar de &[&str]
+    node_ids: &[&str],
     dist_max: f64,
-) -> Result<Vec<(u64, u64, f64)>> {  // ✅ MODIFICADO: retorna (u64, u64, f64)
+) -> Result<Vec<(String, String, f64)>> {
     if node_ids.is_empty() {
         return Ok(Vec::new());
     }
-    
     // placeholders ?,?,?,...
     let placeholders = node_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
     let sql = format!(
@@ -170,9 +168,7 @@ pub fn get_edges_by_node_ids_and_dist(
     );
 
     // Parameters: node_ids for source, node_ids for target, dist_max
-    let mut params: Vec<&dyn duckdb::ToSql> = node_ids.iter()
-        .map(|id| id as &dyn duckdb::ToSql)
-        .collect();
+    let mut params: Vec<&dyn duckdb::ToSql> = node_ids.iter().map(|id| id as &dyn duckdb::ToSql).collect();
     params.extend(node_ids.iter().map(|id| id as &dyn duckdb::ToSql));
     params.push(&dist_max);
 
@@ -181,8 +177,8 @@ pub fn get_edges_by_node_ids_and_dist(
 
     let rows = stmt.query_map(params.as_slice(), |row| {
         Ok((
-            row.get::<_, u64>(0)?,    // ✅ MODIFICADO: source como u64
-            row.get::<_, u64>(1)?,    // ✅ MODIFICADO: target como u64
+            row.get::<_, String>(0)?, // source
+            row.get::<_, String>(1)?, // target
             row.get::<_, f64>(2)?     // dist
         ))
     })?;
@@ -193,18 +189,18 @@ pub fn get_edges_by_node_ids_and_dist(
     Ok(result)
 }
 
-/// ✅ MODIFICADO: Inserts a vector of edges (source, target, dist) into the DuckDB edges table.
+/// Inserts a vector of edges (source, target, dist) into the DuckDB edges table.
 /// 
 /// # Parameters
 /// - conn: active DuckDB connection
-/// - edges: slice of tuples (source, target, dist) where source and target are u64 signatures
+/// - edges: slice of tuples (source, target, dist)
 /// 
 /// # Note
-/// - The table must have columns source (UBIGINT), target (UBIGINT), dist (DOUBLE)
+/// - The table must have columns source (VARCHAR), target (VARCHAR), dist (DOUBLE)
 pub fn insert_edges(
     conn: &Connection,
-    edges: &[(u64, u64, f64)]  // ✅ MODIFICADO: (u64, u64, f64)
-) -> Result<()> {
+    edges: &[(String, String, f64)]
+    ) -> Result<()> {
     let sql = "INSERT INTO edges (source, target, dist) VALUES (?, ?, ?)";
     let mut stmt = conn.prepare(sql)?;
 

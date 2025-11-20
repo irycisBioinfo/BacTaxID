@@ -5,7 +5,6 @@ use bincode;
 use crate::sketch::sketching::*;
 use anyhow::{Result as AnyResult, Context, bail, anyhow};
 
-
 #[derive(Deserialize, Debug)]
 pub struct MetadataConfig {
     pub genus: String,
@@ -18,12 +17,10 @@ pub struct MetadataConfig {
     pub reference_size: i32
 }
 
-
 /// Structure that encapsulates the connection to DuckDB.
 pub struct DuckDb {
     conn: Connection,
 }
-
 
 impl DuckDb {
     /// Initializes a new DuckDB database in the specified file.
@@ -32,24 +29,18 @@ impl DuckDb {
         Ok(DuckDb { conn })
     }
 
-    /// ✅ MODIFICADO: Tabla sketches usa signature UBIGINT como PRIMARY KEY
     pub fn init_sketches_table(&self) -> Result<()> {
         let schema_sql = "
             CREATE TABLE IF NOT EXISTS sketches (
-                signature UBIGINT PRIMARY KEY,
-                sample VARCHAR NOT NULL,
-                sketch BLOB NOT NULL,
-                kmer_size UINTEGER,
-                sketch_size UINTEGER,
-                name VARCHAR
+                sample VARCHAR PRIMARY KEY,
+                sketch BLOB
             );
-            CREATE INDEX IF NOT EXISTS idx_sample ON sketches(sample);
         ";
         self.conn.execute_batch(schema_sql)?;
         Ok(())
     }
 
-    /// ✅ MODIFICADO: Adds a Sketch to the sketches table
+    /// Adds a Sketch to the sketches table
     pub fn add_sketch(&self, sample_id: &str, sketch: &Sketch) -> Result<()> {
         insert_sketch_object(&self.conn, sample_id, sketch)
     }
@@ -59,35 +50,29 @@ impl DuckDb {
         load_sketch_manager_from_db(&self.conn, default_kmer_size, default_sketch_size)
     }
 
-    /// ✅ MODIFICADO: Tabla edges usa signature UBIGINT
+    /// Creates the `edges` table with the specified columns if it does not exist.
     pub fn init_edges_table(&self) -> Result<()> {
         let schema_sql = "
-            CREATE SEQUENCE IF NOT EXISTS id_sequence START 1;
+            CREATE SEQUENCE id_sequence START 1;
             CREATE TABLE IF NOT EXISTS edges (
                 id INTEGER PRIMARY KEY DEFAULT nextval('id_sequence'),
-                source UBIGINT NOT NULL,
-                target UBIGINT NOT NULL,
-                dist DOUBLE NOT NULL,
-                FOREIGN KEY (source) REFERENCES sketches(signature),
-                FOREIGN KEY (target) REFERENCES sketches(signature)
+                source VARCHAR,
+                target VARCHAR,
+                dist DOUBLE
             );
-            CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source);
-            CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target);
-            CREATE INDEX IF NOT EXISTS idx_edges_source_target ON edges(source, target);
         ";
         self.conn.execute_batch(schema_sql)?;
         Ok(())
     }
 
-    /// ✅ MODIFICADO: Tabla debug usa signature UBIGINT
+    /// Creates the `debug` table with the columns `Source`, `Target`, and `dist`.
     pub fn init_debug_table(&self) -> Result<()> {
         let schema_sql = "
             CREATE TABLE IF NOT EXISTS debug (
-                source UBIGINT NOT NULL,
-                target UBIGINT NOT NULL,
-                dist DOUBLE NOT NULL
+                Source VARCHAR ,
+                Target VARCHAR,
+                dist DOUBLE
             );
-            CREATE INDEX IF NOT EXISTS idx_debug_source ON debug(source);
         ";
         self.conn.execute_batch(schema_sql)?;
         Ok(())
@@ -95,6 +80,7 @@ impl DuckDb {
 
     /// Creates and initializes the `levels` table with data based on the provided Vec<f64>.
     pub fn init_levels_table(&self, distances: Vec<f64>) -> Result<()> {
+        // Create the table if it does not exist
         let create_table_sql = "
             CREATE TABLE IF NOT EXISTS levels (
                 level VARCHAR,
@@ -103,10 +89,13 @@ impl DuckDb {
         ";
         self.conn.execute_batch(create_table_sql)?;
 
+        // Clean the existing table
         self.conn.execute("DELETE FROM levels", [])?;
 
+        // Prepare the insert statement
         let mut stmt = self.conn.prepare("INSERT INTO levels (level, dist) VALUES (?, ?)")?;
 
+        // Iterate over the vector and insert each element
         for (index, &distance) in distances.iter().enumerate() {
             let level_name = format!("L_{}", index);
             let dist_value = distance as f64;
@@ -115,9 +104,13 @@ impl DuckDb {
         Ok(())
     }
 
-    /// ✅ MODIFICADO: Tabla code ahora usa signature UBIGINT como PRIMARY KEY
-    /// pero mantiene la columna sample VARCHAR
+    /// Dynamically creates the merged `code` table based on the existing levels in the `levels` table.
+    /// The table will have a `sample` column (VARCHAR, Primary Key) and for each level L_X:
+    /// - L_X_int (INTEGER) - equivalent to the old code table
+    /// - L_X_full (VARCHAR) - equivalent to the old code_full table
+    /// - L_X_state (VARCHAR) - equivalent to the old code_state table
     pub fn init_code_table(&self) -> Result<()> {
+        // Get the names of the levels from the levels table
         let mut stmt = self.conn.prepare("SELECT level FROM levels ORDER BY level")?;
         let mut rows = stmt.query([])?;
 
@@ -127,18 +120,17 @@ impl DuckDb {
             level_columns.push(level_name);
         }
 
-        let mut create_table_sql = String::from(
-            "CREATE TABLE IF NOT EXISTS code (\n    signature UBIGINT PRIMARY KEY,\n    sample VARCHAR NOT NULL"
-        );
-        
+        // Build the SQL to create the table dynamically
+        let mut create_table_sql = String::from("CREATE TABLE IF NOT EXISTS code (\n    sample VARCHAR PRIMARY KEY");
+        // Add L_X_int, L_X_full, L_X_state columns for each level
         for level_name in &level_columns {
             create_table_sql.push_str(&format!(",\n    {}_int INTEGER", level_name));
             create_table_sql.push_str(&format!(",\n    {}_full VARCHAR", level_name));
             create_table_sql.push_str(&format!(",\n    {}_state VARCHAR", level_name));
         }
-        create_table_sql.push_str(",\n    FOREIGN KEY (signature) REFERENCES sketches(signature)");
         create_table_sql.push_str("\n);");
 
+        // Execute the table creation
         self.conn.execute_batch(&create_table_sql)?;
         Ok(())
     }
@@ -154,7 +146,7 @@ impl DuckDb {
                 sketch_size INTEGER,
                 click_size INTEGER,
                 click_threshold DOUBLE,
-                reference_size INTEGER
+                reference_size INTEGER,
             );
         ";
         self.conn.execute_batch(schema_sql)?;
@@ -162,16 +154,20 @@ impl DuckDb {
     }
 
     pub fn create_from_toml(toml_path: &str) -> Result<Self> {
+        // 1. Read and deserialize the TOML file first to get the genus
         let toml_content = fs::read_to_string(toml_path)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
 
         let config: MetadataConfig = toml::from_str(&toml_content)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(e.to_string().into()))?;
 
+        // 2. Generate the database name based on the genus
         let db_name = format!("{}_bactaxid.db", config.acronym);
 
+        // 3. Create a new instance of DuckDb with the generated name
         let db = Self::new(&db_name)?;
 
+        // 4. Initialize all tables using the TOML data
         db.init_all_tables_from_config(&config)?;
 
         Ok(db)
@@ -179,21 +175,26 @@ impl DuckDb {
 
     /// Main function that initializes the entire database from a TOML file.
     pub fn init_database_from_toml(&self, toml_path: &str) -> Result<()> {
+        // 1. Read and deserialize the TOML file
         let toml_content = fs::read_to_string(toml_path)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
 
         let config: MetadataConfig = toml::from_str(&toml_content)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(e.to_string().into()))?;
 
+        // 2. Parse the levels field using an associated function
         let levels_vec = Self::parse_levels_string(&config.levels)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(e.into()))?;
         println!("Parsed levels: {:?}", levels_vec);
 
+        // 4. Initialize metadata table
         self.init_metadata_table()?;
         self.insert_metadata_from_config(&config)?;
 
+        // 5. Initialize levels table
         self.init_levels_table(levels_vec)?;
 
+        // 6. Initialize all other tables
         self.init_edges_table()?;
         self.init_code_table()?;
         self.init_sketches_table()?;
@@ -202,15 +203,19 @@ impl DuckDb {
     }
 
     pub fn init_all_tables_from_config(&self, config: &MetadataConfig) -> Result<()> {
+        // 2. Parse the levels field using the associated function
         let levels_vec = Self::parse_levels_string(&config.levels)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(e.into()))?;
         println!("Parsed levels: {:?}", levels_vec);
 
+        // 4. Initialize metadata table
         self.init_metadata_table()?;
         self.insert_metadata_from_config(config)?;
 
+        // 5. Initialize levels table
         self.init_levels_table(levels_vec)?;
 
+        // 6. Initialize all other tables
         self.init_edges_table()?;
         self.init_code_table()?;
         self.init_sketches_table()?;
@@ -221,17 +226,20 @@ impl DuckDb {
 
     /// Helper function to parse the levels string into Vec<f64>
     fn parse_levels_string(levels_str: &str) -> AnyResult<Vec<f64>> {
+        // Remove brackets and spaces
         let cleaned = levels_str
             .trim()
             .strip_prefix('[')
             .and_then(|s| s.strip_suffix(']'))
             .context("The levels string must be enclosed in brackets []")?;
 
+        // Split by commas and parse each value
         let levels: AnyResult<Vec<f64>> = cleaned
             .split(',')
             .map(|s| {
                 let value = s.trim().parse::<f64>()
                     .with_context(|| format!("Error parsing value '{}'", s.trim()))?;
+                // Validation: ensure it is between 0 and 1
                 if value < 0.0 || value > 1.0 {
                     bail!("Value out of range [0,1]: {}", value);
                 }
@@ -247,6 +255,7 @@ impl DuckDb {
             genus, acronym, levels, kmer_size, sketch_size, click_size, click_threshold, reference_size
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
 
+        // Print the query and parameters for debugging
         println!(
             "SQL: {}\nParams: genus={:?}, acronym={:?}, levels={:?}, kmer_size={:?}, sketch_size={:?}, click_size={:?}, click_threshold={:?}, reference_size={:?}",
             sql,
@@ -277,138 +286,18 @@ impl DuckDb {
 
     /// Reads a TOML file and inserts the data into the metadata table.
     pub fn load_metadata_from_toml(&self, toml_path: &str) -> Result<()> {
+        // Read the TOML file
         let toml_content = fs::read_to_string(toml_path)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
 
+        // Deserialize the TOML content
         let config: MetadataConfig = toml::from_str(&toml_content)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(e.to_string().into()))?;
 
+        // Insert data using the helper function
         self.insert_metadata_from_config(&config)?;
 
         Ok(())
-    }
-
-    // ============================================================
-    // ✅ NUEVOS MÉTODOS PARA TRABAJAR CON SIGNATURES
-    // ============================================================
-
-    /// Retrieve sketch by signature
-    pub fn get_sketch_by_signature(&self, signature: u64) -> AnyResult<Option<Sketch>> {
-        let mut stmt = self.conn.prepare("SELECT sketch FROM sketches WHERE signature = ?")
-            .context("Failed to prepare query")?;
-        
-        let result = stmt.query_row(params![signature], |row| {
-            let sketch_data: Vec<u8> = row.get(0)?;
-            Ok(sketch_data)
-        });
-
-        match result {
-            Ok(sketch_data) => {
-                let sketch: Sketch = bincode::deserialize(&sketch_data)
-                    .context("Failed to deserialize sketch")?;
-                Ok(Some(sketch))
-            }
-            Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(anyhow!("Database error: {}", e)),
-        }
-    }
-
-    /// Check if signature exists
-    pub fn signature_exists(&self, signature: u64) -> Result<bool> {
-        let mut stmt = self.conn.prepare("SELECT COUNT(*) FROM sketches WHERE signature = ?")?;
-        let count: i64 = stmt.query_row(params![signature], |row| row.get(0))?;
-        Ok(count > 0)
-    }
-
-    /// Get sample name from signature
-    pub fn get_sample_name(&self, signature: u64) -> Result<Option<String>> {
-        get_sample_name_by_signature(&self.conn, signature)
-    }
-
-    /// Get multiple sample names from signatures
-    pub fn get_sample_names(&self, signatures: &[u64]) -> Result<Vec<(u64, String)>> {
-        get_sample_names_by_signatures(&self.conn, signatures)
-    }
-
-    /// Get signature from sample name
-    pub fn get_signature_by_sample(&self, sample_id: &str) -> Result<Option<u64>> {
-        let mut stmt = self.conn.prepare("SELECT signature FROM sketches WHERE sample = ?")?;
-        match stmt.query_row(params![sample_id], |row| row.get(0)) {
-            Ok(sig) => Ok(Some(sig)),
-            Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Get all signatures in the database
-    pub fn get_all_signatures(&self) -> Result<Vec<u64>> {
-        let mut stmt = self.conn.prepare("SELECT signature FROM sketches")?;
-        let signatures = stmt.query_map([], |row| row.get(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(signatures)
-    }
-
-    // ============================================================
-    // ✅ MÉTODOS PARA EDGES (AHORA CON SIGNATURES)
-    // ============================================================
-
-    /// Insert edge by signature
-    pub fn add_edge(&self, source_sig: u64, target_sig: u64, distance: f64) -> Result<()> {
-        insert_edge_by_signature(&self.conn, source_sig, target_sig, distance)
-    }
-
-    /// Insert multiple edges in batch
-    pub fn add_edges_batch(&self, edges: &[(u64, u64, f64)]) -> Result<()> {
-        insert_edges_batch(&self.conn, edges)
-    }
-
-    /// Get neighbors of a signature (outgoing edges only)
-    pub fn get_neighbors(&self, signature: u64) -> Result<Vec<(u64, f64)>> {
-        get_edges_by_source(&self.conn, signature)
-    }
-
-    /// Get neighbors with sample names
-    pub fn get_neighbors_with_names(&self, signature: u64) -> Result<Vec<(String, u64, f64)>> {
-        get_neighbors_with_names(&self.conn, signature)
-    }
-
-    /// Get bidirectional edges (both incoming and outgoing)
-    pub fn get_edges_bidirectional(&self, signature: u64) -> Result<Vec<(u64, f64)>> {
-        get_edges_bidirectional(&self.conn, signature)
-    }
-
-    /// Get distance between two signatures
-    pub fn get_distance(&self, source_sig: u64, target_sig: u64) -> Result<Option<f64>> {
-        get_edge_distance(&self.conn, source_sig, target_sig)
-    }
-
-    /// Count edges for a signature
-    pub fn count_edges(&self, signature: u64) -> Result<usize> {
-        count_edges_for_signature(&self.conn, signature)
-    }
-
-    /// Insert debug edge
-    pub fn add_debug_edge(&self, source_sig: u64, target_sig: u64, distance: f64) -> Result<()> {
-        insert_debug_edge(&self.conn, source_sig, target_sig, distance)
-    }
-
-    // ============================================================
-    // ✅ MÉTODOS PARA CODE TABLE
-    // ============================================================
-
-    /// Insert empty code entry
-    pub fn add_empty_code(&self, signature: u64, sample_id: &str) -> Result<()> {
-        insert_empty_code(&self.conn, signature, sample_id)
-    }
-
-    /// Copy code fields up to level
-    pub fn copy_code_fields(&self, input_sig: u64, ref_sig: u64, level: usize) -> Result<()> {
-        copy_code_l_fields_up_to(&self.conn, input_sig, ref_sig, level)
-    }
-
-    /// Copy code full fields up to level
-    pub fn copy_code_full_fields(&self, input_sig: u64, ref_sig: u64, level: usize) -> Result<()> {
-        copy_code_full_l_fields_up_to(&self.conn, input_sig, ref_sig, level)
     }
 
     /// Access to the internal connection, if required for advanced operations.
@@ -417,23 +306,20 @@ impl DuckDb {
     }
 }
 
-
-// ============================================================
-// ✅ FUNCIONES MODIFICADAS PARA USAR SIGNATURE
-// ============================================================
-
-/// ✅ MODIFICADO: Inserts a row in code table using signature and sample
-pub fn insert_empty_code(conn: &Connection, signature: u64, sample_id: &str) -> Result<()> {
+/// Inserts a row in the merged code table
+/// with the sample field equal to `sample_id` and the rest of the columns as NULL.
+pub fn insert_empty_code(conn: &Connection, sample_id: &str) -> Result<()> {
+    // Get all columns except the primary (sample)
     let mut stmt = conn.prepare(
         "SELECT column_name FROM information_schema.columns \
-         WHERE table_name = 'code' AND column_name NOT IN ('signature', 'sample') \
-         ORDER BY ordinal_position"
+         WHERE table_name = 'code' AND column_name != 'sample' ORDER BY ordinal_position"
     )?;
     let columns: Vec<String> = stmt.query_map([], |row| row.get(0))?
         .flatten()
         .collect();
     let n = columns.len();
 
+    // Build the SQL: INSERT INTO code (sample, col1, col2, ...) VALUES (?, NULL, NULL, ...)
     let columns_sql = if n > 0 {
         format!(", {}", columns.join(", "))
     } else { "".to_string() };
@@ -441,23 +327,20 @@ pub fn insert_empty_code(conn: &Connection, signature: u64, sample_id: &str) -> 
         std::iter::repeat("NULL").take(n).collect::<Vec<_>>().join(", ")
     } else { "".to_string() };
     let sql = format!(
-        "INSERT INTO code (signature, sample{columns}) VALUES (?, ?{nulls})",
+        "INSERT INTO code (sample{columns}) VALUES (?{nulls})",
         columns=columns_sql,
         nulls=if n>0 { format!(", {nulls}") } else { "".to_string() },
     );
-    conn.execute(&sql, params![signature, sample_id])?;
+    conn.execute(&sql, params![sample_id])?;
     Ok(())
 }
 
-/// ✅ MODIFICADO: Copies L_X_int fields using signatures
-pub fn copy_code_l_fields_up_to(
-    conn: &Connection, 
-    input_sig: u64, 
-    ref_sig: u64, 
-    l: usize
-) -> Result<()> {
+/// Copies L_X_int fields from ref_id to input_id up to level l (inclusive)
+pub fn copy_code_l_fields_up_to(conn: &Connection, input_id: &str, ref_id: &str, l: usize) -> Result<()> {
+    // Generate list of columns L_0_int to L_L_int
     let columns: Vec<String> = (0..=l).map(|i| format!("L_{}_int", i)).collect();
 
+    // Build UPDATE SQL
     let mut set_expr = String::new();
     for (i, col) in columns.iter().enumerate() {
         if i > 0 {
@@ -467,23 +350,27 @@ pub fn copy_code_l_fields_up_to(
     }
 
     let sql = format!(
-        "UPDATE code SET {set_expr} WHERE signature = ?",
+        "UPDATE code SET {set_expr} WHERE sample = ?",
         set_expr = set_expr
     );
 
+    // Retrieve values from ref_id
     let select_sql = format!(
-        "SELECT {} FROM code WHERE signature = ?",
+        "SELECT {} FROM code WHERE sample = ?",
         columns.join(",")
     );
 
     let mut stmt = conn.prepare(&select_sql)?;
-    let values_row = stmt.query_row([ref_sig], |row| {
+    let values_row = stmt.query_row([ref_id], |row| {
         (0..=l).map(|i| row.get::<_, Option<i32>>(i)).collect::<Result<Vec<_>, _>>()
     })?;
 
+    // Perform UPDATE using params_from_iter
     if values_row.len() == l + 1 {
+        // Create parameter vector
         let mut params: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
 
+        // Add all L_0_int..L_L_int values
         for value in values_row {
             if let Some(v) = value {
                 params.push(Box::new(v));
@@ -492,27 +379,26 @@ pub fn copy_code_l_fields_up_to(
             }
         }
 
-        params.push(Box::new(input_sig));
+        // Add input_id at the end
+        params.push(Box::new(input_id.to_string()));
 
+        // Execute using params_from_iter
         let mut stmt2 = conn.prepare(&sql)?;
         stmt2.execute(params_from_iter(params))?;
         Ok(())
     } else {
         Err(duckdb::Error::ToSqlConversionFailure(
-            format!("Did not obtain L_0_int..L_{}_int for signature '{:016x}'", l, ref_sig).into()
+            format!("Did not obtain L_0_int..L_{}_int for sample '{}'", l, ref_id).into()
         ))      
     }
 }
 
-/// ✅ MODIFICADO: Copies L_X_full fields using signatures
-pub fn copy_code_full_l_fields_up_to(
-    conn: &Connection, 
-    input_sig: u64, 
-    ref_sig: u64, 
-    l: usize
-) -> Result<()> {
+/// Copies L_X_full fields from ref_id to input_id up to level l (inclusive)
+pub fn copy_code_full_l_fields_up_to(conn: &Connection, input_id: &str, ref_id: &str, l: usize) -> Result<()> {
+    // Generate list of columns L_0_full to L_L_full
     let columns: Vec<String> = (0..=l).map(|i| format!("L_{}_full", i)).collect();
 
+    // Build UPDATE SQL
     let mut set_expr = String::new();
     for (i, col) in columns.iter().enumerate() {
         if i > 0 {
@@ -522,23 +408,27 @@ pub fn copy_code_full_l_fields_up_to(
     }
 
     let sql = format!(
-        "UPDATE code SET {set_expr} WHERE signature = ?",
+        "UPDATE code SET {set_expr} WHERE sample = ?",
         set_expr = set_expr
     );
 
+    // Retrieve values from ref_id
     let select_sql = format!(
-        "SELECT {} FROM code WHERE signature = ?",
+        "SELECT {} FROM code WHERE sample = ?",
         columns.join(",")
     );
 
     let mut stmt = conn.prepare(&select_sql)?;
-    let values_row = stmt.query_row([ref_sig], |row| {
+    let values_row = stmt.query_row([ref_id], |row| {
         (0..=l).map(|i| row.get::<_, Option<String>>(i)).collect::<Result<Vec<_>, _>>()
     })?;
 
+    // Perform UPDATE using params_from_iter
     if values_row.len() == l + 1 {
+        // Create parameter vector
         let mut params: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
 
+        // Add all L_0_full..L_L_full values
         for value in values_row {
             if let Some(v) = value {
                 params.push(Box::new(v));
@@ -547,19 +437,21 @@ pub fn copy_code_full_l_fields_up_to(
             }
         }
 
-        params.push(Box::new(input_sig));
+        // Add input_id at the end
+        params.push(Box::new(input_id.to_string()));
 
+        // Execute using params_from_iter
         let mut stmt2 = conn.prepare(&sql)?;
         stmt2.execute(params_from_iter(params))?;
         Ok(())
     } else {
         Err(duckdb::Error::ToSqlConversionFailure(
-            format!("Did not obtain L_0_full..L_{}_full for signature '{:016x}'", l, ref_sig).into()
+            format!("Did not obtain L_0_full..L_{}_full for sample '{}'", l, ref_id).into()
         ))      
     }
 }
 
-/// ✅ MODIFICADO: Inserts a serialized Sketch object into the sketches table
+/// Inserts a serialized Sketch object into the sketches table
 pub fn insert_sketch_object(
     conn: &Connection,
     sample_id: &str,
@@ -568,19 +460,8 @@ pub fn insert_sketch_object(
     let serialized = bincode::serialize(sketch)
         .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
 
-    let mut stmt = conn.prepare(
-        "INSERT INTO sketches (signature, sample, sketch, kmer_size, sketch_size, name) 
-         VALUES (?, ?, ?, ?, ?, ?)"
-    )?;
-    
-    stmt.execute(params![
-        sketch.signature,
-        sample_id,
-        serialized,
-        sketch.kmer_size as u32,
-        sketch.sketch_size as u32,
-        sketch.name
-    ])?;
+    let mut stmt = conn.prepare("INSERT INTO sketches (sample, sketch) VALUES (?, ?)")?;
+    stmt.execute(params![sample_id, serialized])?;
     Ok(())
 }
 
@@ -603,187 +484,7 @@ pub fn get_all_sketch_objects(conn: &Connection) -> Result<Vec<(String, Sketch)>
     Ok(sketches)
 }
 
-// ============================================================
-// ✅ NUEVAS FUNCIONES PARA EDGES CON SIGNATURES
-// ============================================================
-
-/// Insert edge by signature
-pub fn insert_edge_by_signature(
-    conn: &Connection,
-    source_sig: u64,
-    target_sig: u64,
-    distance: f64
-) -> Result<()> {
-    let mut stmt = conn.prepare(
-        "INSERT INTO edges (source, target, dist) VALUES (?, ?, ?)"
-    )?;
-    stmt.execute(params![source_sig, target_sig, distance])?;
-    Ok(())
-}
-
-/// Insert multiple edges in batch
-pub fn insert_edges_batch(
-    conn: &Connection,
-    edges: &[(u64, u64, f64)]
-) -> Result<()> {
-    let mut stmt = conn.prepare(
-        "INSERT INTO edges (source, target, dist) VALUES (?, ?, ?)"
-    )?;
-    
-    for (source, target, dist) in edges {
-        stmt.execute(params![source, target, dist])?;
-    }
-    Ok(())
-}
-
-/// Get edges by source signature
-pub fn get_edges_by_source(
-    conn: &Connection,
-    source_sig: u64
-) -> Result<Vec<(u64, f64)>> {
-    let mut stmt = conn.prepare(
-        "SELECT target, dist FROM edges WHERE source = ? ORDER BY dist"
-    )?;
-    
-    let edges = stmt.query_map(params![source_sig], |row| {
-        Ok((row.get(0)?, row.get(1)?))
-    })?
-    .collect::<Result<Vec<_>, _>>()?;
-    
-    Ok(edges)
-}
-
-/// Get bidirectional edges
-pub fn get_edges_bidirectional(
-    conn: &Connection,
-    signature: u64
-) -> Result<Vec<(u64, f64)>> {
-    let mut stmt = conn.prepare(
-        "SELECT target as other, dist FROM edges WHERE source = ?
-         UNION
-         SELECT source as other, dist FROM edges WHERE target = ?
-         ORDER BY dist"
-    )?;
-    
-    let edges = stmt.query_map(params![signature, signature], |row| {
-        Ok((row.get(0)?, row.get(1)?))
-    })?
-    .collect::<Result<Vec<_>, _>>()?;
-    
-    Ok(edges)
-}
-
-/// Get edge distance between two signatures
-pub fn get_edge_distance(
-    conn: &Connection,
-    source_sig: u64,
-    target_sig: u64
-) -> Result<Option<f64>> {
-    let mut stmt = conn.prepare(
-        "SELECT dist FROM edges WHERE source = ? AND target = ?"
-    )?;
-    
-    match stmt.query_row(params![source_sig, target_sig], |row| row.get(0)) {
-        Ok(dist) => Ok(Some(dist)),
-        Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
-/// Count edges for signature
-pub fn count_edges_for_signature(
-    conn: &Connection,
-    signature: u64
-) -> Result<usize> {
-    let mut stmt = conn.prepare(
-        "SELECT COUNT(*) FROM edges WHERE source = ? OR target = ?"
-    )?;
-    let count: i64 = stmt.query_row(params![signature, signature], |row| row.get(0))?;
-    Ok(count as usize)
-}
-
-/// Get neighbors with sample names
-pub fn get_neighbors_with_names(
-    conn: &Connection,
-    source_sig: u64
-) -> Result<Vec<(String, u64, f64)>> {
-    let mut stmt = conn.prepare(
-        "SELECT s.sample, e.target, e.dist 
-         FROM edges e
-         JOIN sketches s ON e.target = s.signature
-         WHERE e.source = ?
-         ORDER BY e.dist"
-    )?;
-    
-    let neighbors = stmt.query_map(params![source_sig], |row| {
-        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-    })?
-    .collect::<Result<Vec<_>, _>>()?;
-    
-    Ok(neighbors)
-}
-
-/// Insert debug edge
-pub fn insert_debug_edge(
-    conn: &Connection,
-    source_sig: u64,
-    target_sig: u64,
-    distance: f64
-) -> Result<()> {
-    let mut stmt = conn.prepare(
-        "INSERT INTO debug (source, target, dist) VALUES (?, ?, ?)"
-    )?;
-    stmt.execute(params![source_sig, target_sig, distance])?;
-    Ok(())
-}
-
-/// Get sample name by signature
-pub fn get_sample_name_by_signature(
-    conn: &Connection,
-    signature: u64
-) -> Result<Option<String>> {
-    let mut stmt = conn.prepare("SELECT sample FROM sketches WHERE signature = ?")?;
-    
-    match stmt.query_row(params![signature], |row| row.get(0)) {
-        Ok(name) => Ok(Some(name)),
-        Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
-/// Get sample names by signatures (batch query)
-pub fn get_sample_names_by_signatures(
-    conn: &Connection,
-    signatures: &[u64]
-) -> Result<Vec<(u64, String)>> {
-    if signatures.is_empty() {
-        return Ok(Vec::new());
-    }
-    
-    let placeholders = signatures.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let query = format!(
-        "SELECT signature, sample FROM sketches WHERE signature IN ({})",
-        placeholders
-    );
-    
-    let mut stmt = conn.prepare(&query)?;
-    let params: Vec<&dyn duckdb::ToSql> = signatures.iter()
-        .map(|s| s as &dyn duckdb::ToSql)
-        .collect();
-    
-    let results = stmt.query_map(params_from_iter(params.into_iter()), |row| {
-        Ok((row.get(0)?, row.get(1)?))
-    })?
-    .collect::<Result<Vec<_>, _>>()?;
-    
-    Ok(results)
-}
-
-
-// ============================================================
-// TESTS
-// ============================================================
-
+// At the end of your duckdb.rs file
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -800,6 +501,7 @@ mod tests {
         let db = DuckDb::new(":memory:").expect("Could not create database");
         db.init_sketches_table().expect("Could not create sketches table");
 
+        // Check that the sketches table was created correctly
         let columns_check = "SELECT column_name FROM information_schema.columns WHERE table_name = 'sketches' ORDER BY ordinal_position";
         let mut stmt = db.conn.prepare(columns_check).expect("Error preparing query");
         let mut rows = stmt.query([]).expect("Error running query");
@@ -810,31 +512,7 @@ mod tests {
             columns.push(column_name);
         }
 
-        assert_eq!(columns, vec!["signature", "sample", "sketch", "kmer_size", "sketch_size", "name"]);
-    }
-
-    #[test]
-    fn test_code_table_initialization() {
-        let db = DuckDb::new(":memory:").expect("Could not create database");
-        
-        // First create levels table
-        db.init_levels_table(vec![0.95, 0.90, 0.85]).expect("Could not create levels table");
-        
-        // Then create code table
-        db.init_code_table().expect("Could not create code table");
-
-        // Verify code table has signature and sample columns
-        let columns_check = "SELECT column_name FROM information_schema.columns WHERE table_name = 'code' ORDER BY ordinal_position LIMIT 2";
-        let mut stmt = db.conn.prepare(columns_check).expect("Error preparing query");
-        let mut rows = stmt.query([]).expect("Error running query");
-
-        let mut columns = Vec::new();
-        while let Some(row) = rows.next().expect("Error reading row") {
-            let column_name: String = row.get(0).expect("Error getting column_name");
-            columns.push(column_name);
-        }
-
-        assert_eq!(columns, vec!["signature", "sample"]);
+        assert_eq!(columns, vec!["sample", "sketch"]);
     }
 
     #[test]
@@ -845,15 +523,5 @@ mod tests {
     #[test]
     fn test_load_sketch_manager_from_db() {
         // ... test code ...
-    }
-
-    #[test]
-    fn test_edges_with_signatures() {
-        let db = DuckDb::new(":memory:").expect("Could not create database");
-        db.init_sketches_table().expect("Could not create sketches table");
-        db.init_edges_table().expect("Could not create edges table");
-
-        // Test would insert sketches and edges using signatures
-        // Then verify retrieval works correctly
     }
 }

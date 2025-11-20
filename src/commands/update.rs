@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Instant;
 use rayon::prelude::*;
-use duckdb::{Connection, Row, ToSql, params, Result as DuckResult};
+use duckdb::{Connection, Row, ToSql, params,Result as DuckResult};
 use crate::graph::exists_clique;
 
 use crate::{
@@ -256,8 +256,7 @@ pub fn update_command(args: &UpdateArgs) -> Result<()> {
                     .unwrap_or("unknown")
                     .to_string();
 
-                // ✅ CORREGIDO: usar contains_by_name
-                if sketch_manager.contains_by_name(&sample_name) {
+                if sketch_manager.contains(&sample_name) {
                     println!("✓ Sketch for {} already exists, skipping.", sample_name);
                     skipped_files += 1;
                     continue;
@@ -283,43 +282,40 @@ pub fn update_command(args: &UpdateArgs) -> Result<()> {
     Ok(())
 }
 
-/// Query structure
 pub struct Query {
     pub sample_name: String,
-    pub signature: u64,
-    pub code: Vec<usize>,
-    pub code_full: Vec<String>,
-    pub code_state: Vec<String>,
+    pub code: Vec<usize>,         // vector of positive integers
+    pub code_full: Vec<String>,   // vector of strings
+    pub code_state: Vec<String>,  // vector of strings
     pub sketch: SketchManager,
 }
 
 impl Query {
-    /// Creates a new Query
+    /// Creates a new Query, loading SketchManager+Sketch and vectors of appropriate size
     pub fn new(path: &Path, ctx: &UpdateCtx) -> anyhow::Result<Self> {
         let query_creation_start = Instant::now();
 
         let sample_name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
         let n_levels = ctx.levels.len();
 
+        // Vector of positive integers (initialized to 0)
         let code = vec![0_usize; n_levels];
+        // code_full initialized with empty strings ("")
         let code_full = vec!["".to_string(); n_levels];
+        // code_state initialized with "S" (unclassified by default)
         let code_state = vec!["S".to_string(); n_levels];
 
+        // Instantiate SketchManager and load Sketch
         let sketch_creation_start = Instant::now();
         let mut sketch_manager = SketchManager::new(ctx.kmer_size(), ctx.sketch_size());
         let sketch = Sketch::new(path, ctx.kmer_size(), ctx.sketch_size())?;
-        
-        let signature = sketch.signature;
-        
         sketch_manager.add_sketch(sketch)?;
-        println!("    ✓ Sketch created • signature: {:016x} [{:.2}ms]", 
-                 signature, sketch_creation_start.elapsed().as_millis());
+        println!("    ✓ Sketch created [{:.2}ms]", sketch_creation_start.elapsed().as_millis());
 
         println!("    ✓ Query initialized [{:.2}ms]", query_creation_start.elapsed().as_millis());
 
         Ok(Query {
             sample_name,
-            signature,
             code,
             code_full,
             code_state,
@@ -328,7 +324,7 @@ impl Query {
     }
 }
 
-/// Processes one FASTA file
+/// Processes **one** FASTA file
 pub fn update_single_file(
     fasta_path: &Path,
     ctx: &mut UpdateCtx,
@@ -337,40 +333,44 @@ pub fn update_single_file(
 ) -> Result<()> {
     let file_processing_start = Instant::now();
 
+    // -------- 1. Create Query (includes validations, sketch and vectors) --------
     let query_start = Instant::now();
     let mut query = Query::new(fasta_path, ctx)?;
-    println!("  ✓ Query created • sample: {} • signature: {:016x} • k: {} • sketch: {} • levels: {} [{:.2}ms]",
+    println!("  ✓ Query created • sample: {} • k: {} • sketch: {} • levels: {} [{:.2}ms]",
         query.sample_name,
-        query.signature,
         ctx.kmer_size(),
         ctx.sketch_size(),
         ctx.num_levels(),
         query_start.elapsed().as_millis()
     );
 
-    let mut ref_db: Vec<(u64, usize, String, String)>;
-    let mut distances: Vec<(u64, u64, f64)>;
-    let mut bh: Option<(u64, usize, String, String)> = None;
-    let mut ref_ids: Vec<u64> = Vec::new();
+    // -------- 2. Processing variables --------
+    let mut ref_db: Vec<(String, usize, String, String)>;
+    let mut distances: Vec<(String, String, f64)>;
+    let mut bh: Option<(String, usize, String, String)> = None;
+    let mut ref_ids: Vec<String> = Vec::new();
 
     let click_threshold = ctx.click_threshold();
     let click_size = ctx.click_size();
     let reference_size = ctx.reference_size();
 
+    // -------- 3. Process each level in ascending order of distance --------
     for i in 0..ctx.levels.len() {
         let level_start = Instant::now();
         println!("    🔍 Processing level {} [{:.4} threshold]", i, ctx.levels[i].1);
 
+        // 3.1 Retrieve initial classifiers (condition = "C")
         let classifiers_start = Instant::now();
         ref_db = if i == 0 {
             retrieve_classifiers(ctx.connection_mut(), i, "", "C")?
         } else {
             retrieve_classifiers(ctx.connection_mut(), i, &query.code_full[i - 1], "C")?
         };
-        ref_ids = ref_db.iter().map(|(sig, _, _, _)| *sig).collect();
+        ref_ids = ref_db.iter().map(|(sample, _, _, _)| sample.clone()).collect();
         println!("      ✓ Classifiers obtained: {} [{:.2}ms]",
                  ref_ids.len(), classifiers_start.elapsed().as_millis());
 
+        // 3.2 Calculate distances
         let distances_start = Instant::now();
         distances = pw_one_to_many(
             &query.sketch,
@@ -381,12 +381,13 @@ pub fn update_single_file(
         println!("      ✓ Distances calculated: {} [{:.2}ms]",
                  distances.len(), distances_start.elapsed().as_millis());
 
+        // --- DEBUG: save distances if debug == true ---
         if debug {
             let debug_start = Instant::now();
             let tx = ctx.connection_mut().transaction()?;
             for (q, r, d) in &distances {
                 tx.execute(
-                    "INSERT INTO debug (source, target, dist) VALUES (?1, ?2, ?3)",
+                    "INSERT INTO debug (Source, Target,dist) VALUES (?1, ?2, ?3)",
                     params![q, r, d],
                 )?;
             }
@@ -394,21 +395,25 @@ pub fn update_single_file(
             println!("      ✓ Debug data saved [{:.2}ms]", debug_start.elapsed().as_millis());
         }
 
+        // 3.3 Process distances
         if !distances.is_empty() {
             let best_hit_start = Instant::now();
+            // 5. Update according to best_hit
             bh = best_hit(&distances, &ref_db);
             println!("      ✓ Best hit calculated [{:.2}ms]", best_hit_start.elapsed().as_millis());
 
+            // Get values for best_hit
             let code_val = bh.as_ref().map_or(0, |(_, code, _, _)| *code);
             let code_full_val = bh
                 .as_ref()
                 .map_or_else(|| "".to_string(), |(_, _, cf, _)| cf.clone());
 
             if code_val != 0 {
+                // Update query with valid best hit
                 query.code[i] = code_val;
                 query.code_full[i] = code_full_val.clone();
 
-                if i > 0 && !query.code_full[i].starts_with(&query.code_full[i-1]) {
+                if i > 0 && query.code_full[i].starts_with(query.code_full[i-1].as_str()) == false {
                     println!("Warning: code_full of best hit '{}' is inconsistent with previous level '{}' at level {}, treating as no candidates",
                         query.code_full[i], query.code_full[i-1], i);
                     panic!("Inconsistency in code_full between consecutive levels");
@@ -427,6 +432,7 @@ pub fn update_single_file(
                 println!("      ✓ Classifier evaluated [{:.2}ms]", classifier_check_start.elapsed().as_millis());
 
                 println!("    ✓ Level {} completed with best hit [{:.2}ms]", i, level_start.elapsed().as_millis());
+                // Continue to next level
                 continue;
             } else {
                 println!(
@@ -436,6 +442,7 @@ pub fn update_single_file(
             }
         }
 
+        // 3.4 No valid candidates (or code == 0): search with condition = "ALL"
         println!(
             "      No valid candidates at level {}, searching with condition = 'ALL'...",
             i
@@ -447,7 +454,7 @@ pub fn update_single_file(
         } else {
             retrieve_classifiers(ctx.connection_mut(), i, &query.code_full[i - 1], "ALL")?
         };
-        ref_ids = ref_db.iter().map(|(sig, _, _, _)| *sig).collect();
+        ref_ids = ref_db.iter().map(|(sample, _, _, _)| sample.clone()).collect();
         println!("      ✓ References (ALL) obtained: {} [{:.2}ms]",
                  ref_ids.len(), all_classifiers_start.elapsed().as_millis());
 
@@ -461,12 +468,13 @@ pub fn update_single_file(
         println!("      ✓ Distances (ALL) calculated: {} [{:.2}ms]",
                  distances.len(), all_distances_start.elapsed().as_millis());
 
+        // --- DEBUG: save distances if debug == true ---
         if debug {
             let debug_start = Instant::now();
             let tx = ctx.connection_mut().transaction()?;
             for (q, r, d) in &distances {
                 tx.execute(
-                    "INSERT INTO debug (source, target, dist) VALUES (?1, ?2, ?3)",
+                    "INSERT INTO debug (Source, Target,dist) VALUES (?1, ?2, ?3)",
                     params![q, r, d],
                 )?;
             }
@@ -475,6 +483,7 @@ pub fn update_single_file(
         }
 
         if !distances.is_empty() {
+            // 3.5 Search for cliques and create new groups
             let cliques_start = Instant::now();
             let levels = ctx.levels.clone();
             let click_size = ctx.click_size();
@@ -489,15 +498,15 @@ pub fn update_single_file(
         }
     }
 
+    // -------- 4. Update database and save sketch --------
     let db_update_start = Instant::now();
     update_duckdb(ctx.connection_mut(), &query)?;
     println!("    ✓ Database updated [{:.2}ms]", db_update_start.elapsed().as_millis());
 
     let sketch_save_start = Instant::now();
-    // ✅ CORREGIDO: usar get_sketch_by_name
     let sketch = query
         .sketch
-        .get_sketch_by_name(&query.sample_name)
+        .get_sketch(&query.sample_name)
         .expect("Sketch should exist after Query::new()");
     insert_sketch_object(ctx.conn, &query.sample_name, sketch)
         .with_context(|| format!("Error saving sketch for sample: {}", query.sample_name))?;
@@ -507,25 +516,27 @@ pub fn update_single_file(
     println!("    ✓ Sketch saved [{:.2}ms]", sketch_save_start.elapsed().as_millis());
 
     println!(
-        "✓ Complete processing • sample: {} • signature: {:016x} • final code: {:?} [{:.2}s]",
-        query.sample_name, query.signature, query.code, file_processing_start.elapsed().as_secs_f32()
+        "✓ Complete processing • sample: {} • final code: {:?} [{:.2}s]",
+        query.sample_name, query.code, file_processing_start.elapsed().as_secs_f32()
     );
 
     Ok(())
 }
 
+/// Retrieves classifiers from the merged code table
 pub fn retrieve_classifiers(
     conn: &Connection,
     level: usize,
     group: &str,
     condition: &str,
-) -> Result<Vec<(u64, usize, String, String)>> {
+) -> Result<Vec<(String, usize, String, String)>> {
     let query_start = Instant::now();
 
     let level_int_col = format!("L_{}_int", level);
     let level_full_col = format!("L_{}_full", level);
     let level_state_col = format!("L_{}_state", level);
 
+    // For filters, need level-1 (except when level = 0)
     let filter_full_col = if level == 0 {
         format!("L_{}_full", level)
     } else {
@@ -533,10 +544,11 @@ pub fn retrieve_classifiers(
     };
 
     let (sql, params): (String, Vec<&dyn duckdb::ToSql>) = match (level, condition) {
+        // Level 0 with condition 'C'
         (0, "C") => (
             format!(
                 "SELECT 
-                    signature,
+                    sample,
                     {level_int_col} as code,
                     {level_full_col} as code_full,
                     {level_state_col} as code_state
@@ -546,10 +558,11 @@ pub fn retrieve_classifiers(
             Vec::new()
         ),
 
+        // Level 0 with condition 'ALL'
         (0, "ALL") => (
             format!(
                 "SELECT 
-                    signature,
+                    sample,
                     {level_int_col} as code,
                     {level_full_col} as code_full,
                     {level_state_col} as code_state
@@ -559,10 +572,11 @@ pub fn retrieve_classifiers(
             Vec::new()
         ),
 
+        // Level > 0 with condition 'C'
         (level, "C") if level > 0 => (
             format!(
                 "SELECT 
-                    signature,
+                    sample,
                     {level_int_col} as code,
                     {level_full_col} as code_full,
                     {level_state_col} as code_state
@@ -573,10 +587,11 @@ pub fn retrieve_classifiers(
             vec![&group as &dyn duckdb::ToSql]
         ),
 
+        // Level > 0 with condition 'ALL'
         (level, "ALL") if level > 0 => (
             format!(
                 "SELECT 
-                    signature,
+                    sample,
                     {level_int_col} as code,
                     {level_full_col} as code_full,
                     {level_state_col} as code_state
@@ -587,6 +602,7 @@ pub fn retrieve_classifiers(
             vec![&group as &dyn duckdb::ToSql]
         ),
 
+        // Unrecognized condition
         _ => {
             bail!("Invalid condition '{}'. Use 'C' or 'ALL'", condition);
         }
@@ -601,10 +617,11 @@ pub fn retrieve_classifiers(
     while let Some(row) = rows.next()? {
         row_count += 1;
 
-        let signature: u64 = match row.get::<_, Option<u64>>(0)? {
+        // Safe handling of nullable columns
+        let sample: String = match row.get::<_, Option<String>>(0)? {
             Some(val) => val,
             None => {
-                println!("WARNING: NULL signature at row {}, skipping", row_count);
+                println!("WARNING: NULL sample at row {}, skipping", row_count);
                 continue;
             }
         };
@@ -639,62 +656,72 @@ pub fn retrieve_classifiers(
             }
         };
 
-        result.push((signature, code, code_full, code_state));
+        result.push((sample, code, code_full, code_state));
     }
 
     let duration = query_start.elapsed();
-    if duration.as_millis() > 10 {
+    if duration.as_millis() > 10 { // Only report if takes more than 10ms
         println!("        └─ SQL query executed [{:.2}ms]", duration.as_millis());
     }
 
     Ok(result)
 }
 
+/// Finds the maximum similarity and returns the corresponding tuple from ref_db.
 pub fn best_hit(
-    distances: &[(u64, u64, f64)],
-    ref_db: &[(u64, usize, String, String)],
-) -> Option<(u64, usize, String, String)> {
+    distances: &[(String, String, f64)],
+    ref_db: &[(String, usize, String, String)],
+) -> Option<(String, usize, String, String)> {
+    // 1. Find minimum distance (ignore NaN)
     let best_distance = distances
         .iter()
         .filter(|(_, _, dist)| !dist.is_nan())
         .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap())?;
 
-    let best_ref_sig = best_distance.1;
+    // 2. Get ref_name of best hit
+    let best_ref_name = &best_distance.1;
 
+    // 3. Find the corresponding tuple in ref_db
     ref_db
         .iter()
-        .find(|(sig, _, _, _)| *sig == best_ref_sig)
+        .find(|(sample, _, _, _)| sample == best_ref_name)
         .cloned()
 }
 
+/// Determines if a best_hit passes classifier criteria.
 pub fn is_classifier(
-    distances: &[(u64, u64, f64)],
-    best_hit: &(u64, usize, String, String),
-    ref_db: &[(u64, usize, String, String)],
+    distances: &[(String, String, f64)],
+    best_hit: &(String, usize, String, String),
+    ref_db: &[(String, usize, String, String)],
     click_threshold: f64,
     reference_size: usize,
 ) -> bool {
+    // Extract code_full from best_hit
     let best_full = &best_hit.2;
 
+    // 1. Count how many rows in ref_db have same code_full
     let count_ref = ref_db
         .iter()
         .filter(|(_, _, code_full, _)| code_full == best_full)
         .count();
 
+    // If count_ref >= reference_size, return false
     if count_ref >= reference_size {
         return false;
     }
 
+    // 2. Count in distances how many matches point to samples with that code_full
     let count_dist = distances
         .iter()
-        .filter(|(_, target_sig, _)| {
+        .filter(|(_, target_sample, _)| {
             ref_db
                 .iter()
-                .find(|(sig, _, code_full, _)| sig == target_sig && code_full == best_full)
+                .find(|(sample, _, code_full, _)| sample == target_sample && code_full == best_full)
                 .is_some()
         })
         .count();
 
+    // 3. Compute ratio and compare to threshold
     if count_ref == 0 {
         return false;
     }
@@ -702,9 +729,10 @@ pub fn is_classifier(
     ratio >= click_threshold
 }
 
+/// Searches for cliques at specific taxonomic levels and updates the Query object.
 pub fn look_for_cliques(
     conn: &mut Connection,
-    distances: &[(u64, u64, f64)],
+    distances: &[(String, String, f64)],
     level: usize,
     levels: &[(String, f64)],
     click_size: usize,
@@ -712,22 +740,25 @@ pub fn look_for_cliques(
 ) -> Result<(), duckdb::Error> {
     let clique_search_start = Instant::now();
 
+    // 1. Insert edges
     let edges_insert_start = Instant::now();
-    let edges_to_insert: Vec<(u64, u64, f64)> = distances
+    let edges_to_insert: Vec<(String, String, f64)> = distances
         .iter()
-        .map(|(q, r, d)| (*q, *r, *d))
+        .map(|(q, r, d)| (q.clone(), r.clone(), *d))
         .collect();
     insert_edges(conn, &edges_to_insert)?;
     println!("        ✓ Inserted {} edges [{:.2}ms]",
              edges_to_insert.len(), edges_insert_start.elapsed().as_millis());
 
+    // 2. Unique IDs
     let mut unique_ids = hashbrown::HashSet::new();
     for (q, r, _) in distances {
-        unique_ids.insert(*q);
-        unique_ids.insert(*r);
+        unique_ids.insert(q.clone());
+        unique_ids.insert(r.clone());
     }
-    let node_ids: Vec<u64> = unique_ids.into_iter().collect();
+    let node_ids: Vec<String> = unique_ids.into_iter().collect();
 
+    // 3. Level loop
     for j in level..levels.len() {
         let level_clique_start = Instant::now();
         let (_level_name, dist_threshold) = &levels[j];
@@ -749,21 +780,25 @@ pub fn look_for_cliques(
                 j, clique_nodes.len(), clique_edges.len(), clique_check_start.elapsed().as_millis()
             );
 
+            // 4. Update code for level j
             let code_update_start = Instant::now();
             set_clique_code_for_query(conn, query, j)?;
             println!("        ✓ Query code updated [{:.2}ms]",
                      code_update_start.elapsed().as_millis());
 
+            // 5. Propagate values to clique nodes
             let clique_update_start = Instant::now();
             update_clique_samples(conn, &clique_nodes, j, query)?;
             println!("        ✓ Clique samples updated [{:.2}ms]",
                      clique_update_start.elapsed().as_millis());
 
+            // 6. Propagate values to nodes outside clique with state "S"
             let non_clique_update_start = Instant::now();
             update_non_clique_samples(conn, &node_ids, &clique_nodes, j, query)?;
             println!("        ✓ Non-clique samples updated [{:.2}ms]",
                      non_clique_update_start.elapsed().as_millis());
 
+            // 7. Delete invalid edges
             let edge_cleanup_start = Instant::now();
             let delete_dist_threshold = if j == levels.len() - 1 {
                 1.0
@@ -795,6 +830,8 @@ pub fn look_for_cliques(
     Ok(())
 }
 
+/// Updates code, code_full and code_state field of `query` at `level`
+/// based on data from merged `code` table.
 pub fn set_clique_code_for_query(
     conn: &mut Connection,
     query: &mut Query,
@@ -802,6 +839,7 @@ pub fn set_clique_code_for_query(
 ) -> Result<(), duckdb::Error> {
     let level_int_col = format!("L_{}_int", level);
 
+    // 1. Get max code value from `code` table
     let max_code_opt: Option<i64> = if level == 0 {
         conn.query_row(
             &format!("SELECT MAX({}) FROM code", level_int_col),
@@ -820,10 +858,12 @@ pub fn set_clique_code_for_query(
         )?
     };
 
+    // 2. Assign code = max_code + 1 and state
     let code_value = max_code_opt.unwrap_or(0) as usize + 1;
     query.code[level] = code_value;
     query.code_state[level] = "C".to_string();
 
+    // 3. Build code_full
     if level == 0 {
         query.code_full[0] = code_value.to_string();
     } else if code_value == 0 {
@@ -845,9 +885,11 @@ pub fn set_clique_code_for_query(
     Ok(())
 }
 
+/// Propagates values from `query` at `level` to all `samples` in the clique
+/// in the merged `code` table.
 pub fn update_clique_samples(
     conn: &mut Connection,
-    clique_nodes: &[u64],
+    clique_nodes: &[String],
     level: usize,
     query: &Query,
 ) -> Result<(), duckdb::Error> {
@@ -859,23 +901,30 @@ pub fn update_clique_samples(
     let full_col = format!("L_{}_full", level);
     let state_col = format!("L_{}_state", level);
 
-    for signature in clique_nodes {
+    for sample in clique_nodes {
+        // Use UPSERT (INSERT ... ON CONFLICT DO UPDATE)
         conn.execute(
             &format!(
-                "UPDATE code SET {int_col} = ?, {full_col} = ?, {state_col} = ? \
-                 WHERE signature = ?"
+                "INSERT INTO code (sample, {int_col}, {full_col}, {state_col}) \
+                 VALUES (?, ?, ?, ?) \
+                 ON CONFLICT(sample) DO UPDATE SET \
+                 {int_col} = excluded.{int_col}, \
+                 {full_col} = excluded.{full_col}, \
+                 {state_col} = excluded.{state_col}"
             ),
-            params![code_val, full_val, state_val, signature],
+            params![sample, code_val, full_val, state_val],
         )?;
     }
 
     Ok(())
 }
 
+/// Propagates values from `query` at `level` to nodes NOT in clique
+/// with state "S" in merged `code` table.
 pub fn update_non_clique_samples(
     conn: &mut Connection,
-    all_nodes: &[u64],
-    clique_nodes: &[u64],
+    all_nodes: &[String],
+    clique_nodes: &[String],
     level: usize,
     query: &Query,
 ) -> Result<(), duckdb::Error> {
@@ -887,27 +936,33 @@ pub fn update_non_clique_samples(
     let full_col = format!("L_{}_full", level);
     let state_col = format!("L_{}_state", level);
 
-    for signature in all_nodes.iter().filter(|s| !clique_nodes.contains(s)) {
+    for sample in all_nodes.iter().filter(|s| !clique_nodes.contains(s)) {
+        // Use UPSERT
         conn.execute(
             &format!(
-                "UPDATE code SET {int_col} = ?, {full_col} = ?, {state_col} = ? \
-                 WHERE signature = ?"
+                "INSERT INTO code (sample, {int_col}, {full_col}, {state_col}) \
+                 VALUES (?, ?, ?, ?) \
+                 ON CONFLICT(sample) DO UPDATE SET \
+                 {int_col} = excluded.{int_col}, \
+                 {full_col} = excluded.{full_col}, \
+                 {state_col} = excluded.{state_col}"
             ),
-            params![code_val, full_val, state_val, signature],
+            params![sample, code_val, full_val, state_val],
         )?;
     }
 
     Ok(())
 }
 
+/// Saves all query values to the merged code table
 pub fn update_duckdb(
     conn: &mut Connection,
     query: &Query,
 ) -> DuckResult<()> {
-    let signature = query.signature;
     let sample = &query.sample_name;
     let n = query.code.len();
 
+    // Build dynamic list of columns
     let mut int_cols = Vec::new();
     let mut full_cols = Vec::new();
     let mut state_cols = Vec::new();
@@ -924,28 +979,27 @@ pub fn update_duckdb(
         state_values.push(&query.code_state[i]);
     }
 
+    // Build dynamic SQL
     let all_cols = [&int_cols[..], &full_cols[..], &state_cols[..]].concat();
-    let placeholders: String = std::iter::repeat("?")
-        .take(all_cols.len() + 2)
-        .collect::<Vec<_>>()
-        .join(", ");
+    let placeholders: String = std::iter::repeat("?").take(all_cols.len() + 1).collect::<Vec<_>>().join(", ");
 
     let update_sets: Vec<String> = all_cols.iter()
         .map(|col| format!("{} = excluded.{}", col, col))
         .collect();
 
     let sql = format!(
-        "INSERT INTO code (signature, sample, {}) VALUES ({}) \
-         ON CONFLICT(signature) DO UPDATE SET {}",
+        "INSERT INTO code (sample, {}) VALUES ({}) \
+         ON CONFLICT(sample) DO UPDATE SET {}",
         all_cols.join(", "),
         placeholders,
         update_sets.join(", ")
     );
 
+    // Prepare parameters
     let mut params: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
-    params.push(Box::new(signature));
     params.push(Box::new(sample.clone()));
 
+    // Add values in order: int, full, state
     for val in int_values {
         params.push(Box::new(val));
     }
@@ -956,6 +1010,7 @@ pub fn update_duckdb(
         params.push(Box::new(val.clone()));
     }
 
+    // Execute with params_from_iter
     let mut stmt = conn.prepare(&sql)?;
     stmt.execute(duckdb::params_from_iter(params))?;
 

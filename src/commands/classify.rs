@@ -1,3 +1,4 @@
+
 use clap::Args;
 use anyhow::{Result, Context, anyhow};
 use hashbrown::HashMap;
@@ -28,13 +29,11 @@ pub struct ClassifyArgs {
     pub verbose: bool,
 }
 
-/// ✅ MODIFICADO: Classification result for a single query
+/// Classification result for a single query
 #[derive(Debug, Clone)]
 pub struct ClassificationResult {
     pub query_id: String,
-    pub query_signature: u64,        // ✅ NUEVO
     pub best_hit_id: String,
-    pub best_hit_signature: u64,     // ✅ NUEVO
     pub similarity_score: f64,
     pub levels_reached: usize,
     pub final_code: Vec<usize>,
@@ -94,17 +93,16 @@ impl<'a> ClassifyCtx<'a> {
     }
 }
 
-/// ✅ MODIFICADO: Query structure for classification
+/// Query structure for classification (simplified version of update Query)
 pub struct ClassifyQuery {
     pub sample_name: String,
-    pub signature: u64,          // ✅ NUEVO
     pub code: Vec<usize>,
     pub code_full: Vec<String>,
     pub sketch: SketchManager,
 }
 
 impl ClassifyQuery {
-    /// Create a new ClassifyQuery
+    /// Create a new ClassifyQuery (similar to update Query::new but without code_state)
     pub fn new(path: &Path, ctx: &ClassifyCtx) -> Result<Self> {
         let query_creation_start = Instant::now();
         let sample_name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
@@ -118,21 +116,15 @@ impl ClassifyQuery {
         let sketch_creation_start = Instant::now();
         let mut sketch_manager = SketchManager::new(ctx.kmer_size(), ctx.sketch_size());
         let sketch = Sketch::new(path, ctx.kmer_size(), ctx.sketch_size())?;
-        
-        // ✅ NUEVO: Get signature from sketch
-        let signature = sketch.signature;
-        
         sketch_manager.add_sketch(sketch)?;
         
         if ctx.metadata_map.get("verbose").unwrap_or(&"false".to_string()) == "true" {
-            println!(" ✓ Sketch created • signature: {:016x} [{:.2}ms]", 
-                     signature, sketch_creation_start.elapsed().as_millis());
+            println!(" ✓ Sketch created [{:.2}ms]", sketch_creation_start.elapsed().as_millis());
             println!(" ✓ Query initialized [{:.2}ms]", query_creation_start.elapsed().as_millis());
         }
         
         Ok(ClassifyQuery {
             sample_name,
-            signature,  // ✅ NUEVO
             code,
             code_full,
             sketch: sketch_manager,
@@ -211,14 +203,13 @@ fn load_metadata_map(conn: &Connection) -> Result<HashMap<String, String>> {
     Ok(row)
 }
 
-/// ✅ MODIFICADO: Retrieve classifiers from the merged code table
-/// Retorna (signature, code, code_full, code_state)
+/// Retrieve classifiers from the merged code table (exact copy from update.rs)
 pub fn retrieve_classifiers(
     conn: &Connection,
     level: usize,
     group: &str,
     condition: &str,
-) -> Result<Vec<(u64, usize, String, String)>> {  // ✅ MODIFICADO: retorna u64
+) -> Result<Vec<(String, usize, String, String)>> {
     let query_start = Instant::now();
     let level_int_col = format!("L_{}_int", level);
     let level_full_col = format!("L_{}_full", level);
@@ -236,7 +227,7 @@ pub fn retrieve_classifiers(
         (0, "C") => (
             format!(
                 "SELECT   
-                 signature,
+                 sample,
                  {level_int_col} as code,
                  {level_full_col} as code_full,
                  {level_state_col} as code_state
@@ -249,7 +240,7 @@ pub fn retrieve_classifiers(
         (level, "C") if level > 0 => (
             format!(
                 "SELECT   
-                 signature,
+                 sample,
                  {level_int_col} as code,
                  {level_full_col} as code_full,
                  {level_state_col} as code_state
@@ -272,12 +263,11 @@ pub fn retrieve_classifiers(
     
     while let Some(row) = rows.next()? {
         row_count += 1;
-        
-        // ✅ MODIFICADO: Read signature as u64
-        let signature: u64 = match row.get::<_, Option<u64>>(0)? {
+        // Safe handling of nullable columns
+        let sample: String = match row.get::<_, Option<String>>(0)? {
             Some(val) => val,
             None => {
-                println!("WARNING: NULL signature at row {}, skipping", row_count);
+                println!("WARNING: NULL sample at row {}, skipping", row_count);
                 continue;
             }
         };
@@ -312,39 +302,40 @@ pub fn retrieve_classifiers(
             }
         };
         
-        result.push((signature, code, code_full, code_state));  // ✅ MODIFICADO
+        result.push((sample, code, code_full, code_state));
     }
     
     let duration = query_start.elapsed();
-    if duration.as_millis() > 10 {
+    if duration.as_millis() > 10 { // Only report if takes more than 10ms
         println!(" └─ SQL query executed [{:.2}ms]", duration.as_millis());
     }
     
     Ok(result)
 }
 
-/// ✅ MODIFICADO: Find best hit
+/// Find best hit (exact copy from update.rs)
 pub fn best_hit(
-    distances: &[(u64, u64, f64)],  // ✅ MODIFICADO
-    ref_db: &[(u64, usize, String, String)],  // ✅ MODIFICADO
-) -> Option<(u64, usize, String, String)> {  // ✅ MODIFICADO
-    // 1. Find maximum distance (ignore NaN)
+    distances: &[(String, String, f64)],
+    ref_db: &[(String, usize, String, String)],
+) -> Option<(String, usize, String, String)> {
+    // 1. Find minimum distance (ignore NaN)
     let best_distance = distances
         .iter()
         .filter(|(_, _, dist)| !dist.is_nan())
         .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap())?;
     
-    // 2. Get ref_signature of best hit
-    let best_ref_sig = best_distance.1;  // ✅ MODIFICADO
+    // 2. Get ref_name of best hit
+    let best_ref_name = &best_distance.1;
     
     // 3. Find the corresponding tuple in ref_db
     ref_db
         .iter()
-        .find(|(sig, _, _, _)| *sig == best_ref_sig)  // ✅ MODIFICADO
+        .find(|(sample, _, _, _)| sample == best_ref_name)
         .cloned()
 }
 
-/// ✅ MODIFICADO: Classify a single query file
+/// Classify a single query file (simplified version of update_single_file)
+/// DETIENE LA BÚSQUEDA cuando no se encuentra un best hit sobre los classifiers
 pub fn classify_single_file(
     fasta_path: &Path,
     ctx: &mut ClassifyCtx,
@@ -358,9 +349,8 @@ pub fn classify_single_file(
     let mut query = ClassifyQuery::new(fasta_path, ctx)?;
     
     if verbose {
-        println!(" ✓ Query created • sample: {} • signature: {:016x} • k: {} • sketch: {} • levels: {} [{:.2}ms]",
+        println!(" ✓ Query created • sample: {} • k: {} • sketch: {} • levels: {} [{:.2}ms]",
             query.sample_name,
-            query.signature,
             ctx.kmer_size(),
             ctx.sketch_size(),
             ctx.num_levels(),
@@ -369,10 +359,10 @@ pub fn classify_single_file(
     }
     
     // 2. Processing variables
-    let mut ref_db: Vec<(u64, usize, String, String)>;  // ✅ MODIFICADO
-    let mut distances: Vec<(u64, u64, f64)>;  // ✅ MODIFICADO
-    let mut bh: Option<(u64, usize, String, String)> = None;  // ✅ MODIFICADO
-    let mut ref_ids: Vec<u64> = Vec::new();  // ✅ MODIFICADO
+    let mut ref_db: Vec<(String, usize, String, String)>;
+    let mut distances: Vec<(String, String, f64)>;
+    let mut bh: Option<(String, usize, String, String)> = None;
+    let mut ref_ids: Vec<String> = Vec::new();
     let mut levels_reached = 0;
     let mut final_best_hit = None;
     let mut final_similarity = 0.0;
@@ -392,7 +382,7 @@ pub fn classify_single_file(
         } else {
             retrieve_classifiers(ctx.connection_mut(), i, &query.code_full[i - 1], "C")?
         };
-        ref_ids = ref_db.iter().map(|(sig, _, _, _)| *sig).collect();  // ✅ MODIFICADO
+        ref_ids = ref_db.iter().map(|(sample, _, _, _)| sample.clone()).collect();
         
         if verbose {
             println!(" ✓ Classifiers obtained: {} [{:.2}ms]",
@@ -475,7 +465,7 @@ pub fn classify_single_file(
         }
         
         // 3.11 Calculate similarity for this best hit
-        if let Some(best_distance_tuple) = distances.iter().find(|(_, ref_sig, _)| *ref_sig == best_hit_tuple.0) {  // ✅ MODIFICADO
+        if let Some(best_distance_tuple) = distances.iter().find(|(_, ref_name, _)| ref_name == &best_hit_tuple.0) {
             final_similarity = best_distance_tuple.2;
         }
         
@@ -487,35 +477,27 @@ pub fn classify_single_file(
             println!(" ✓ Level {} completed successfully • code: {} • full: '{}' • sim: {:.4} [{:.2}ms]", 
                 i, code_val, code_full_val, final_similarity, level_start.elapsed().as_millis());
         }
+        
+        // Continue to next level (no early stopping conditions in classify)
     }
     
     // 4. Create classification result
-    let best_hit_info = final_best_hit.unwrap_or((0, 0, "".to_string(), "".to_string()));  // ✅ MODIFICADO
+    let best_hit_info = final_best_hit.unwrap_or(("Unknown".to_string(), 0, "".to_string(), "".to_string()));
     
     // Get best hit full classification from database
     let mut best_hit_code = vec![0_usize; ctx.num_levels()];
     let mut best_hit_code_full = vec!["".to_string(); ctx.num_levels()];
-    let mut best_hit_sample_name = "Unknown".to_string();
     
     // Query for best hit classification
     let num_levels = ctx.num_levels();
-    if best_hit_info.0 != 0 {  // ✅ MODIFICADO: check signature != 0
-        if let Ok(hit_classification) = get_sample_full_classification_by_signature(
-            ctx.connection_mut(), 
-            best_hit_info.0,  // ✅ MODIFICADO: use signature
-            num_levels
-        ) {
-            best_hit_code = hit_classification.0;
-            best_hit_code_full = hit_classification.1;
-            best_hit_sample_name = hit_classification.2;
-        }
+    if let Ok(hit_classification) = get_sample_full_classification(ctx.connection_mut(), &best_hit_info.0, num_levels) {
+        best_hit_code = hit_classification.0;
+        best_hit_code_full = hit_classification.1;
     }
     
     let result = ClassificationResult {
         query_id: query.sample_name.clone(),
-        query_signature: query.signature,  // ✅ NUEVO
-        best_hit_id: best_hit_sample_name,
-        best_hit_signature: best_hit_info.0,  // ✅ NUEVO
+        best_hit_id: best_hit_info.0,
         similarity_score: final_similarity,
         levels_reached,
         final_code: query.code,
@@ -526,9 +508,8 @@ pub fn classify_single_file(
     
     if verbose {
         println!(
-            "✓ Classification complete • sample: {} • signature: {:016x} • levels_reached: {} • best_hit: {} ({:016x}) • similarity: {:.4} [{:.2}s]",
-            result.query_id, result.query_signature, result.levels_reached, 
-            result.best_hit_id, result.best_hit_signature, result.similarity_score, 
+            "✓ Classification complete • sample: {} • levels_reached: {} • best_hit: {} • similarity: {:.4} [{:.2}s]",
+            result.query_id, result.levels_reached, result.best_hit_id, result.similarity_score, 
             file_processing_start.elapsed().as_secs_f32()
         );
     }
@@ -536,12 +517,12 @@ pub fn classify_single_file(
     Ok(result)
 }
 
-/// ✅ MODIFICADO: Get full classification for a sample from database by signature
-fn get_sample_full_classification_by_signature(
+/// Get full classification for a sample from database
+fn get_sample_full_classification(
     conn: &mut Connection, 
-    signature: u64,  // ✅ MODIFICADO: use signature instead of sample_name
+    sample_name: &str, 
     num_levels: usize
-) -> Result<(Vec<usize>, Vec<String>, String)> {  // ✅ MODIFICADO: also return sample name
+) -> Result<(Vec<usize>, Vec<String>)> {
     let mut int_cols = Vec::new();
     let mut full_cols = Vec::new();
     
@@ -550,45 +531,44 @@ fn get_sample_full_classification_by_signature(
         full_cols.push(format!("L_{}_full", i));
     }
     
-    let all_cols = [&["sample".to_string()], &int_cols[..], &full_cols[..]].concat();  // ✅ MODIFICADO: include sample
-    let sql = format!("SELECT {} FROM code WHERE signature = ? LIMIT 1", all_cols.join(", "));  // ✅ MODIFICADO
+    let all_cols = [&int_cols[..], &full_cols[..]].concat();
+    let sql = format!("SELECT {} FROM code WHERE sample = ? LIMIT 1", all_cols.join(", "));
     
     let mut stmt = conn.prepare(&sql)?;
-    let row = stmt.query_row([signature], |row| {  // ✅ MODIFICADO
-        let sample: String = row.get(0)?;  // ✅ NUEVO
+    let row = stmt.query_row([sample_name], |row| {
         let mut codes = Vec::new();
         let mut code_fulls = Vec::new();
         
-        // Read int values (offset by 1 because of sample column)
+        // Read int values
         for i in 0..num_levels {
-            let code: Option<i64> = row.get(1 + i)?;  // ✅ MODIFICADO: offset by 1
+            let code: Option<i64> = row.get(i)?;
             codes.push(code.unwrap_or(0) as usize);
         }
         
-        // Read full values (offset by 1 + num_levels)
+        // Read full values
         for i in 0..num_levels {
-            let code_full: Option<String> = row.get(1 + num_levels + i)?;  // ✅ MODIFICADO: offset by 1
+            let code_full: Option<String> = row.get(num_levels + i)?;
             code_fulls.push(code_full.unwrap_or_default());
         }
         
-        Ok((codes, code_fulls, sample))  // ✅ MODIFICADO: return sample name too
+        Ok((codes, code_fulls))
     })?;
     
     Ok(row)
 }
 
+
+
 fn save_results(results: &[ClassificationResult], output_path: &str) -> anyhow::Result<()> {
     let mut output_file = std::fs::File::create(output_path)?;
-    // ✅ MODIFICADO: Añadidas columnas de signature
-    writeln!(output_file, "query_id\tquery_signature\tbest_hit_id\tbest_hit_signature\tsimilarity_score\tlevels_reached\tfinal_code\tbest_hit_code")?;
+    // Cabecera
+    writeln!(output_file, "query_id\tbest_hit_id\tsimilarity_score\tlevels_reached\tfinal_code\tbest_hit_code")?;
     for result in results {
         writeln!(
             output_file,
-            "{}\t{:016x}\t{}\t{:016x}\t{:.6}\t{}\t{}\t{}",
+            "{}\t{}\t{:.6}\t{}\t{}\t{}",
             result.query_id,
-            result.query_signature,
             result.best_hit_id,
-            result.best_hit_signature,
             result.similarity_score,
             result.levels_reached,
             result.final_code.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("."),
@@ -597,7 +577,6 @@ fn save_results(results: &[ClassificationResult], output_path: &str) -> anyhow::
     }
     Ok(())
 }
-
 /// Main function for the classify command
 pub fn classify_command(args: &ClassifyArgs) -> Result<()> {
     let command_start = Instant::now();
@@ -745,12 +724,10 @@ pub fn classify_command(args: &ClassifyArgs) -> Result<()> {
                 // Show some examples
                 println!("\nExample results:");
                 for (i, result) in results.iter().take(5).enumerate() {
-                    println!("  {}: {} ({:016x}) -> {} ({:016x}) (sim: {:.4}, levels: {})", 
+                    println!("  {}: {} -> {} (sim: {:.4}, levels: {})", 
                         i + 1,
-                        result.query_id,
-                        result.query_signature,
+                        result.query_id, 
                         result.best_hit_id,
-                        result.best_hit_signature,
                         result.similarity_score,
                         result.levels_reached
                     );

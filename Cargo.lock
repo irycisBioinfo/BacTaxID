@@ -329,7 +329,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.12",
  "toml",
- "twox-hash",
  "wyrand",
 ]
 
@@ -2054,15 +2053,6 @@ name = "toml_writer"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fcc842091f2def52017664b53082ecbbeb5c7731092bad69d2c63050401dfd64"
-
-[[package]]
-name = "twox-hash"
-version = "2.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
-dependencies = [
- "rand 0.9.1",
-]
 
 [[package]]
 name = "unicode-ident"
