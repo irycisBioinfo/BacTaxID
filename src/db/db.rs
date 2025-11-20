@@ -32,7 +32,8 @@ impl DuckDb {
     pub fn init_sketches_table(&self) -> Result<()> {
         let schema_sql = "
             CREATE TABLE IF NOT EXISTS sketches (
-                sample VARCHAR PRIMARY KEY,
+                signature UBIGINT PRIMARY KEY,
+                name VARCHAR,
                 sketch BLOB
             );
         ";
@@ -41,8 +42,8 @@ impl DuckDb {
     }
 
     /// Adds a Sketch to the sketches table
-    pub fn add_sketch(&self, sample_id: &str, sketch: &Sketch) -> Result<()> {
-        insert_sketch_object(&self.conn, sample_id, sketch)
+    pub fn add_sketch(&self, sketch: &Sketch) -> Result<()> {
+        insert_sketch_object(&self.conn, sketch)
     }
 
     /// Reconstructs a SketchManager from the database
@@ -53,11 +54,11 @@ impl DuckDb {
     /// Creates the `edges` table with the specified columns if it does not exist.
     pub fn init_edges_table(&self) -> Result<()> {
         let schema_sql = "
-            CREATE SEQUENCE id_sequence START 1;
+            CREATE SEQUENCE IF NOT EXISTS id_sequence START 1;
             CREATE TABLE IF NOT EXISTS edges (
                 id INTEGER PRIMARY KEY DEFAULT nextval('id_sequence'),
-                source VARCHAR,
-                target VARCHAR,
+                source UBIGINT,
+                target UBIGINT,
                 dist DOUBLE
             );
         ";
@@ -69,9 +70,21 @@ impl DuckDb {
     pub fn init_debug_table(&self) -> Result<()> {
         let schema_sql = "
             CREATE TABLE IF NOT EXISTS debug (
-                Source VARCHAR ,
+                Source VARCHAR,
                 Target VARCHAR,
                 dist DOUBLE
+            );
+        ";
+        self.conn.execute_batch(schema_sql)?;
+        Ok(())
+    }
+
+    /// Creates the `duplicates` table with signature and sample columns.
+    pub fn init_duplicates_table(&self) -> Result<()> {
+        let schema_sql = "
+            CREATE TABLE IF NOT EXISTS duplicates (
+                signature UBIGINT REFERENCES code(signature),
+                sample VARCHAR
             );
         ";
         self.conn.execute_batch(schema_sql)?;
@@ -105,10 +118,13 @@ impl DuckDb {
     }
 
     /// Dynamically creates the merged `code` table based on the existing levels in the `levels` table.
-    /// The table will have a `sample` column (VARCHAR, Primary Key) and for each level L_X:
-    /// - L_X_int (INTEGER) - equivalent to the old code table
-    /// - L_X_full (VARCHAR) - equivalent to the old code_full table
-    /// - L_X_state (VARCHAR) - equivalent to the old code_state table
+    /// The table will have:
+    /// - signature UBIGINT (Primary Key)
+    /// - sample VARCHAR (sample name for queries and joins)
+    /// - For each level L_X:
+    ///   - L_X_int (INTEGER)
+    ///   - L_X_full (VARCHAR)
+    ///   - L_X_state (VARCHAR)
     pub fn init_code_table(&self) -> Result<()> {
         // Get the names of the levels from the levels table
         let mut stmt = self.conn.prepare("SELECT level FROM levels ORDER BY level")?;
@@ -121,7 +137,10 @@ impl DuckDb {
         }
 
         // Build the SQL to create the table dynamically
-        let mut create_table_sql = String::from("CREATE TABLE IF NOT EXISTS code (\n    sample VARCHAR PRIMARY KEY");
+        let mut create_table_sql = String::from(
+            "CREATE TABLE IF NOT EXISTS code (\n    signature UBIGINT PRIMARY KEY,\n    sample VARCHAR"
+        );
+        
         // Add L_X_int, L_X_full, L_X_state columns for each level
         for level_name in &level_columns {
             create_table_sql.push_str(&format!(",\n    {}_int INTEGER", level_name));
@@ -146,7 +165,7 @@ impl DuckDb {
                 sketch_size INTEGER,
                 click_size INTEGER,
                 click_threshold DOUBLE,
-                reference_size INTEGER,
+                reference_size INTEGER
             );
         ";
         self.conn.execute_batch(schema_sql)?;
@@ -187,38 +206,45 @@ impl DuckDb {
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(e.into()))?;
         println!("Parsed levels: {:?}", levels_vec);
 
-        // 4. Initialize metadata table
+        // 3. Initialize metadata table
         self.init_metadata_table()?;
         self.insert_metadata_from_config(&config)?;
 
-        // 5. Initialize levels table
+        // 4. Initialize levels table
         self.init_levels_table(levels_vec)?;
 
-        // 6. Initialize all other tables
-        self.init_edges_table()?;
+        // 5. Initialize code table (depends on levels)
         self.init_code_table()?;
+        
+        // 6. Initialize other tables
+        self.init_edges_table()?;
         self.init_sketches_table()?;
+        self.init_duplicates_table()?;
         self.init_debug_table()?;
+        
         Ok(())
     }
 
     pub fn init_all_tables_from_config(&self, config: &MetadataConfig) -> Result<()> {
-        // 2. Parse the levels field using the associated function
+        // 1. Parse the levels field using the associated function
         let levels_vec = Self::parse_levels_string(&config.levels)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(e.into()))?;
         println!("Parsed levels: {:?}", levels_vec);
 
-        // 4. Initialize metadata table
+        // 2. Initialize metadata table
         self.init_metadata_table()?;
         self.insert_metadata_from_config(config)?;
 
-        // 5. Initialize levels table
+        // 3. Initialize levels table
         self.init_levels_table(levels_vec)?;
 
-        // 6. Initialize all other tables
-        self.init_edges_table()?;
+        // 4. Initialize code table (depends on levels)
         self.init_code_table()?;
+        
+        // 5. Initialize other tables
+        self.init_edges_table()?;
         self.init_sketches_table()?;
+        self.init_duplicates_table()?;
         self.init_debug_table()?;
 
         Ok(())
@@ -307,36 +333,41 @@ impl DuckDb {
 }
 
 /// Inserts a row in the merged code table
-/// with the sample field equal to `sample_id` and the rest of the columns as NULL.
-pub fn insert_empty_code(conn: &Connection, sample_id: &str) -> Result<()> {
-    // Get all columns except the primary (sample)
+/// with the signature field equal to `signature`, sample equal to `sample_name`,
+/// and the rest of the columns as NULL.
+pub fn insert_empty_code(conn: &Connection, signature: u64, sample_name: &str) -> Result<()> {
+    // Get all columns except the primary (signature) and sample
     let mut stmt = conn.prepare(
         "SELECT column_name FROM information_schema.columns \
-         WHERE table_name = 'code' AND column_name != 'sample' ORDER BY ordinal_position"
+         WHERE table_name = 'code' AND column_name NOT IN ('signature', 'sample') \
+         ORDER BY ordinal_position"
     )?;
     let columns: Vec<String> = stmt.query_map([], |row| row.get(0))?
         .flatten()
         .collect();
     let n = columns.len();
 
-    // Build the SQL: INSERT INTO code (sample, col1, col2, ...) VALUES (?, NULL, NULL, ...)
+    // Build the SQL: INSERT INTO code (signature, sample, col1, col2, ...) VALUES (?, ?, NULL, NULL, ...)
     let columns_sql = if n > 0 {
         format!(", {}", columns.join(", "))
     } else { "".to_string() };
+    
     let nulls: String = if n > 0 {
         std::iter::repeat("NULL").take(n).collect::<Vec<_>>().join(", ")
     } else { "".to_string() };
+    
     let sql = format!(
-        "INSERT INTO code (sample{columns}) VALUES (?{nulls})",
-        columns=columns_sql,
-        nulls=if n>0 { format!(", {nulls}") } else { "".to_string() },
+        "INSERT INTO code (signature, sample{columns}) VALUES (?, ?{nulls})",
+        columns = columns_sql,
+        nulls = if n > 0 { format!(", {}", nulls) } else { "".to_string() },
     );
-    conn.execute(&sql, params![sample_id])?;
+    
+    conn.execute(&sql, params![signature as u64, sample_name])?;
     Ok(())
 }
 
-/// Copies L_X_int fields from ref_id to input_id up to level l (inclusive)
-pub fn copy_code_l_fields_up_to(conn: &Connection, input_id: &str, ref_id: &str, l: usize) -> Result<()> {
+/// Copies L_X_int fields from ref_sig to input_sig up to level l (inclusive)
+pub fn copy_code_l_fields_up_to(conn: &Connection, input_sig: u64, ref_sig: u64, l: usize) -> Result<()> {
     // Generate list of columns L_0_int to L_L_int
     let columns: Vec<String> = (0..=l).map(|i| format!("L_{}_int", i)).collect();
 
@@ -350,18 +381,18 @@ pub fn copy_code_l_fields_up_to(conn: &Connection, input_id: &str, ref_id: &str,
     }
 
     let sql = format!(
-        "UPDATE code SET {set_expr} WHERE sample = ?",
+        "UPDATE code SET {set_expr} WHERE signature = ?",
         set_expr = set_expr
     );
 
-    // Retrieve values from ref_id
+    // Retrieve values from ref_sig
     let select_sql = format!(
-        "SELECT {} FROM code WHERE sample = ?",
+        "SELECT {} FROM code WHERE signature = ?",
         columns.join(",")
     );
 
     let mut stmt = conn.prepare(&select_sql)?;
-    let values_row = stmt.query_row([ref_id], |row| {
+    let values_row = stmt.query_row([ref_sig as u64], |row| {
         (0..=l).map(|i| row.get::<_, Option<i32>>(i)).collect::<Result<Vec<_>, _>>()
     })?;
 
@@ -379,8 +410,8 @@ pub fn copy_code_l_fields_up_to(conn: &Connection, input_id: &str, ref_id: &str,
             }
         }
 
-        // Add input_id at the end
-        params.push(Box::new(input_id.to_string()));
+        // Add input_sig at the end
+        params.push(Box::new(input_sig as u64));
 
         // Execute using params_from_iter
         let mut stmt2 = conn.prepare(&sql)?;
@@ -388,13 +419,13 @@ pub fn copy_code_l_fields_up_to(conn: &Connection, input_id: &str, ref_id: &str,
         Ok(())
     } else {
         Err(duckdb::Error::ToSqlConversionFailure(
-            format!("Did not obtain L_0_int..L_{}_int for sample '{}'", l, ref_id).into()
+            format!("Did not obtain L_0_int..L_{}_int for signature '{}'", l, ref_sig).into()
         ))      
     }
 }
 
-/// Copies L_X_full fields from ref_id to input_id up to level l (inclusive)
-pub fn copy_code_full_l_fields_up_to(conn: &Connection, input_id: &str, ref_id: &str, l: usize) -> Result<()> {
+/// Copies L_X_full fields from ref_sig to input_sig up to level l (inclusive)
+pub fn copy_code_full_l_fields_up_to(conn: &Connection, input_sig: u64, ref_sig: u64, l: usize) -> Result<()> {
     // Generate list of columns L_0_full to L_L_full
     let columns: Vec<String> = (0..=l).map(|i| format!("L_{}_full", i)).collect();
 
@@ -408,18 +439,18 @@ pub fn copy_code_full_l_fields_up_to(conn: &Connection, input_id: &str, ref_id: 
     }
 
     let sql = format!(
-        "UPDATE code SET {set_expr} WHERE sample = ?",
+        "UPDATE code SET {set_expr} WHERE signature = ?",
         set_expr = set_expr
     );
 
-    // Retrieve values from ref_id
+    // Retrieve values from ref_sig
     let select_sql = format!(
-        "SELECT {} FROM code WHERE sample = ?",
+        "SELECT {} FROM code WHERE signature = ?",
         columns.join(",")
     );
 
     let mut stmt = conn.prepare(&select_sql)?;
-    let values_row = stmt.query_row([ref_id], |row| {
+    let values_row = stmt.query_row([ref_sig as u64], |row| {
         (0..=l).map(|i| row.get::<_, Option<String>>(i)).collect::<Result<Vec<_>, _>>()
     })?;
 
@@ -437,8 +468,8 @@ pub fn copy_code_full_l_fields_up_to(conn: &Connection, input_id: &str, ref_id: 
             }
         }
 
-        // Add input_id at the end
-        params.push(Box::new(input_id.to_string()));
+        // Add input_sig at the end
+        params.push(Box::new(input_sig as u64));
 
         // Execute using params_from_iter
         let mut stmt2 = conn.prepare(&sql)?;
@@ -446,7 +477,7 @@ pub fn copy_code_full_l_fields_up_to(conn: &Connection, input_id: &str, ref_id: 
         Ok(())
     } else {
         Err(duckdb::Error::ToSqlConversionFailure(
-            format!("Did not obtain L_0_full..L_{}_full for sample '{}'", l, ref_id).into()
+            format!("Did not obtain L_0_full..L_{}_full for signature '{}'", l, ref_sig).into()
         ))      
     }
 }
@@ -454,32 +485,31 @@ pub fn copy_code_full_l_fields_up_to(conn: &Connection, input_id: &str, ref_id: 
 /// Inserts a serialized Sketch object into the sketches table
 pub fn insert_sketch_object(
     conn: &Connection,
-    sample_id: &str,
     sketch: &Sketch
 ) -> Result<()> {
     let serialized = bincode::serialize(sketch)
         .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
 
-    let mut stmt = conn.prepare("INSERT INTO sketches (sample, sketch) VALUES (?, ?)")?;
-    stmt.execute(params![sample_id, serialized])?;
+    let mut stmt = conn.prepare("INSERT INTO sketches (signature, name, sketch) VALUES (?, ?, ?)")?;
+    stmt.execute(params![sketch.signature as u64, sketch.name, serialized])?;
     Ok(())
 }
 
 /// Gets all Sketch objects from the table (to reconstruct SketchManager)
-pub fn get_all_sketch_objects(conn: &Connection) -> Result<Vec<(String, Sketch)>> {
-    let mut stmt = conn.prepare("SELECT sample, sketch FROM sketches")?;
+pub fn get_all_sketch_objects(conn: &Connection) -> Result<Vec<(u64, Sketch)>> {
+    let mut stmt = conn.prepare("SELECT signature, sketch FROM sketches")?;
     let rows = stmt.query_map([], |row| {
-        let sample_id: String = row.get(0)?;
+        let signature: u64 = row.get(0)?;
         let sketch_data: Vec<u8> = row.get(1)?;
-        Ok((sample_id, sketch_data))
+        Ok((signature as u64, sketch_data))
     })?;
 
     let mut sketches = Vec::new();
     for row in rows {
-        let (sample_id, sketch_data) = row?;
+        let (signature, sketch_data) = row?;
         let sketch: Sketch = bincode::deserialize(&sketch_data)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
-        sketches.push((sample_id, sketch));
+        sketches.push((signature, sketch));
     }
     Ok(sketches)
 }
@@ -512,7 +542,7 @@ mod tests {
             columns.push(column_name);
         }
 
-        assert_eq!(columns, vec!["sample", "sketch"]);
+        assert_eq!(columns, vec!["signature", "name", "sketch"]);
     }
 
     #[test]

@@ -9,12 +9,14 @@ use std::io::{BufWriter,BufReader};
 use rayon::prelude::*;
 use anyhow::{Result, Context, anyhow, bail};
 use duckdb::Connection;
+use twox_hash::XxHash64; 
+use std::hash::Hasher; 
+
 
 use std::{
     error::Error,
     path::Path,
 };
-
 
 /// Structure that represents a sketch of a biological sequence
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +29,8 @@ pub struct Sketch {
     pub sketch_size: usize,
     /// Filename without extension
     pub name: String,
+    /// xxHash64 signature of the sketch vector
+    pub signature: u64,
 }
 
 impl Sketch {
@@ -47,11 +51,15 @@ impl Sketch {
             .unwrap_or("unknown")
             .to_string();
 
+        // Calculate signature from sketch vector
+        let signature = compute_sketch_signature(&sketch);
+
         Ok(Sketch {
             sketch,
             kmer_size,
             sketch_size,
             name,
+            signature,
         })
     }
 
@@ -68,11 +76,12 @@ impl Sketch {
     /// Gets basic information about the sketch
     pub fn info(&self) -> String {
         format!(
-            "Sketch: {} (k={}, size={}, bins_filled={})",
+            "Sketch: {} (k={}, size={}, bins_filled={}, signature={})",
             self.name,
             self.kmer_size,
             self.sketch_size,
-            self.sketch.iter().filter(|&&x| x != u64::MAX).count()
+            self.sketch.iter().filter(|&&x| x != u64::MAX).count(),
+            self.signature
         )
     }
 }
@@ -80,7 +89,7 @@ impl Sketch {
 /// Container to manage multiple sketches
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SketchManager {
-    sketches: HashMap<String, Sketch>,
+    sketches: HashMap<u64, Sketch>,
     /// Default parameters for new sketches
     pub default_kmer_size: usize,
     pub default_sketch_size: usize,
@@ -99,16 +108,17 @@ impl SketchManager {
     pub fn length(&self) -> usize {
         self.sketches.len()
     }
+
     /// 2. Adds a new sketch to the HashMap
     pub fn add_sketch(&mut self, sketch: Sketch) -> Result<()> {
-        let name = sketch.name.clone();
+        let signature = sketch.signature;
 
-        // ✅ SOLUTION: Use bail! instead of format!().into()
-        if self.sketches.contains_key(&name) {
-            bail!("Sketch with name '{}' already exists", name);
+        // ✅ Check if signature already exists
+        if self.sketches.contains_key(&signature) {
+            bail!("Sketch with signature '{}' already exists", signature);
         }
 
-        self.sketches.insert(name, sketch);
+        self.sketches.insert(signature, sketch);
         Ok(())
     }
 
@@ -123,18 +133,28 @@ impl SketchManager {
         self.add_sketch(sketch)
     }
 
-    /// Gets a sketch by name
-    pub fn get_sketch(&self, name: &str) -> Option<&Sketch> {
-        self.sketches.get(name)
+    /// Gets a sketch by signature
+    pub fn get_sketch(&self, signature: u64) -> Option<&Sketch> {
+        self.sketches.get(&signature)
     }
 
-    /// Removes a sketch by name
-    pub fn remove_sketch(&mut self, name: &str) -> Option<Sketch> {
-        self.sketches.remove(name)
+    /// Gets a sketch by name (helper function)
+    pub fn get_sketch_by_name(&self, name: &str) -> Option<&Sketch> {
+        self.sketches.values().find(|s| s.name == name)
+    }
+
+    /// Removes a sketch by signature
+    pub fn remove_sketch(&mut self, signature: u64) -> Option<Sketch> {
+        self.sketches.remove(&signature)
     }
 
     /// Lists all available sketch names
     pub fn list_sketches(&self) -> Vec<String> {
+        self.sketches.values().map(|s| s.name.clone()).collect()
+    }
+
+    /// Lists all available sketch signatures
+    pub fn list_signatures(&self) -> Vec<u64> {
         self.sketches.keys().cloned().collect()
     }
 
@@ -143,48 +163,27 @@ impl SketchManager {
         self.sketches.len()
     }
 
-    pub fn contains(&self, name: &str) -> bool {
-        self.sketches.contains_key(name)
+    pub fn contains(&self, signature: u64) -> bool {
+        self.sketches.contains_key(&signature)
     }
 
-    /// Calculates the distance between two sketches by name
-    pub fn distance_between(&self, name1: &str, name2: &str) -> Result<f64> {
-        let sketch1 = self.sketches.get(name1)
-            .ok_or_else(|| anyhow!("Sketch '{}' not found", name1))?;
+    pub fn contains_by_name(&self, name: &str) -> bool {
+        self.sketches.values().any(|s| s.name == name)
+    }
 
-        let sketch2 = self.sketches.get(name2)
-            .ok_or_else(|| anyhow!("Sketch '{}' not found", name2))?;
+    /// Calculates the distance between two sketches by signature
+    pub fn distance_between(&self, sig1: u64, sig2: u64) -> Result<f64> {
+        let sketch1 = self.sketches.get(&sig1)
+            .ok_or_else(|| anyhow!("Sketch with signature '{}' not found", sig1))?;
+
+        let sketch2 = self.sketches.get(&sig2)
+            .ok_or_else(|| anyhow!("Sketch with signature '{}' not found", sig2))?;
 
         if !sketch1.is_compatible(sketch2) {
             anyhow::bail!("Sketches are not compatible (different k-mer or sketch size)");
         }
 
         Ok(sketch1.distance(sketch2))
-    }
-
-    /// 3. Saves the HashMap to disk using bincode
-    // pub fn save_to_disk<P: AsRef<Path>>(&self, file_path: P) -> Result<()> {
-    //     // Create the output file
-    //     let file = File::create(file_path)?;
-    //     let writer = BufWriter::new(file);
-    //     // Serialize using bincode
-    //     bincode::serialize_into(writer, self)?;
-    //     Ok(())
-    // }
-
-    // /// 4. Loads the HashMap from disk using bincode
-    // pub fn load_from_disk<P: AsRef<Path>>(file_path: P) -> Result<Self> {
-    //     // Open the input file
-    //     let file = File::open(file_path)?;
-    //     let reader = BufReader::new(file);
-    //     // Deserialize using bincode
-    //     let sketch_manager: SketchManager = bincode::deserialize_from(reader)?;
-    //     Ok(sketch_manager)
-    // }
-
-    /// Helper function to check if a file exists
-    pub fn file_exists<P: AsRef<Path>>(file_path: P) -> bool {
-        file_path.as_ref().exists()
     }
 }
 
@@ -194,11 +193,11 @@ pub fn load_sketch_manager_from_db(
     default_sketch_size: usize
 ) -> Result<SketchManager> {
     // 1. Get all serialized data sequentially
-    let mut stmt = conn.prepare("SELECT sample, sketch FROM sketches")?;
+    let mut stmt = conn.prepare("SELECT signature, sketch FROM sketches")?;
     let rows = stmt.query_map([], |row| {
-        let sample_id: String = row.get(0)?;
+        let signature: u64 = row.get(0)?;
         let sketch_data: Vec<u8> = row.get(1)?;
-        Ok((sample_id, sketch_data))
+        Ok((signature, sketch_data))
     })?;
 
     // 2. Gather in a Vec for parallelization
@@ -215,12 +214,12 @@ pub fn load_sketch_manager_from_db(
     }
 
     // 3. Parallelize deserialization and HashMap construction
-    let sketches: HashMap<String, Sketch> = raw_data
+    let sketches: HashMap<u64, Sketch> = raw_data
         .into_par_iter()
-        .map(|(sample_id, sketch_data)| {
+        .map(|(signature, sketch_data)| {
             let sketch: Sketch = bincode::deserialize(&sketch_data)
                 .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
-            Ok((sample_id, sketch))
+            Ok((signature, sketch))
         })
         .collect::<Result<HashMap<_, _>, duckdb::Error>>()?;
 
@@ -267,7 +266,19 @@ pub fn binwise_minhash<P: AsRef<Path>>(
     Ok(signs)
 }
 
-// This function actually returns ANI instead of Jaccard
+/// Computes xxHash64 signature of a sketch vector
+/// This function creates a unique identifier for each sketch
+fn compute_sketch_signature(sketch: &[u64]) -> u64 {
+    let mut hasher = XxHash64::with_seed(0);
+    
+    // Hash each u64 in little-endian format for reproducibility
+    for &value in sketch {
+        hasher.write(&value.to_le_bytes());
+    }
+    
+    hasher.finish()
+}
+
 /// Calculates the Jaccard index between two sketches and converts it to ANI.
 /// - `sketch1` and `sketch2`: Vectors of minimum hashes
 /// - `kmer_size`: Size of the k-mers used for the sketch.
@@ -285,7 +296,7 @@ pub fn jaccard_index(sketch1: &[u64], sketch2: &[u64], kmer_size: usize) -> f64 
 
     if jaccard_value == 0.0 {
         return 0.0; // Minimum similarity
-    } else{
+    } else {
         // Compute Mash distance: D = -1/k * ln(2j/(1+j))
         let mash_distance = -((2.0 * jaccard_value) / (1.0 + jaccard_value)).ln() / kmer_size as f64;
 
@@ -298,28 +309,28 @@ pub fn jaccard_index(sketch1: &[u64], sketch2: &[u64], kmer_size: usize) -> f64 
 }
 
 /// Compares the query_manager sketches against a specific subset of sketches 
-/// in reference_manager, only returning those comparisons with distance < max_dist.
+/// in reference_manager, only returning those comparisons with distance > min_dist.
 ///
 /// # Arguments
 /// - `query_manager`: SketchManager with query/source sketches.
 /// - `reference_manager`: SketchManager with reference sketches.
-/// - `subset_ids`: List of specific IDs to compare from reference_manager.
-/// - `max_dist`: Maximum distance. Only distances < max_dist are returned.
+/// - `subset_sigs`: List of specific signatures to compare from reference_manager.
+/// - `min_dist`: Minimum distance. Only distances > min_dist are returned.
 ///
 /// # Returns
-/// Vector of tuples (query_name, reference_name, distance) where distance < max_dist.
+/// Vector of tuples (query_name, reference_name, distance) where distance > min_dist.
 pub fn pw_one_to_many(
     query_manager: &SketchManager,
     reference_manager: &SketchManager,
-    subset_ids: &[String],
+    subset_sigs: &[u64],
     min_dist: f64,
-) -> Vec<(String, String, f64)> {
-    query_manager.sketches.par_iter().flat_map(|(source_name, source_sketch)| {
-        subset_ids.par_iter().filter_map(move |target_id| {
-            reference_manager.get_sketch(target_id).and_then(|target_sketch| {
+) -> Vec<(u64, u64, f64)> {
+    query_manager.sketches.par_iter().flat_map(|(query_sig, source_sketch)| {
+        subset_sigs.par_iter().filter_map(move |target_sig| {
+            reference_manager.get_sketch(*target_sig).and_then(|target_sketch| {
                 let dist = source_sketch.distance(target_sketch);
                 if dist > min_dist {
-                    Some((source_name.clone(), target_id.clone(), dist))
+                    Some((*query_sig, *target_sig, dist))
                 } else {
                     None
                 }
@@ -343,11 +354,11 @@ pub fn pw_one_to_all(
     reference_manager: &SketchManager,
     max_dist: f64,
 ) -> Vec<(String, String, f64)> {
-    query_manager.sketches.par_iter().flat_map(|(source_name, source_sketch)| {
-        reference_manager.sketches.par_iter().filter_map(move |(target_name, target_sketch)| {
+    query_manager.sketches.par_iter().flat_map(|(_, source_sketch)| {
+        reference_manager.sketches.par_iter().filter_map(move |(_, target_sketch)| {
             let dist = source_sketch.distance(target_sketch);
             if dist < max_dist {
-                Some((source_name.clone(), target_name.clone(), dist))
+                Some((source_sketch.name.clone(), target_sketch.name.clone(), dist))
             } else {
                 None
             }

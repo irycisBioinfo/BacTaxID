@@ -128,99 +128,110 @@ fn load_metadata_map(conn: &Connection) -> Result<HashMap<String, String>> {
     Ok(row)
 }
 
-/// Read sample IDs from text file
-fn read_sample_ids(ids_file: &str) -> Result<Vec<String>> {
+/// Read sample names from text file
+fn read_sample_names(ids_file: &str) -> Result<Vec<String>> {
     let start = Instant::now();
     
     let content = fs::read_to_string(ids_file)
         .with_context(|| format!("Error reading IDs file: {}", ids_file))?;
     
-    let ids: Vec<String> = content
+    let names: Vec<String> = content
         .lines()
         .map(|line| line.trim().to_string())
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .collect();
     
-    if ids.is_empty() {
-        return Err(anyhow!("IDs file is empty or contains no valid IDs"));
+    if names.is_empty() {
+        return Err(anyhow!("IDs file is empty or contains no valid sample names"));
     }
     
     let duration = start.elapsed();
-    println!("✓ Loaded {} sample IDs from file [{:.2}ms]",
-             ids.len(), duration.as_millis());
+    println!("✓ Loaded {} sample names from file [{:.2}ms]",
+             names.len(), duration.as_millis());
     
-    Ok(ids)
+    Ok(names)
 }
 
-/// Verify that all sample IDs exist in the database
-fn verify_samples_exist(conn: &Connection, ids: &[String]) -> Result<()> {
+/// Verify that all sample names exist in the database and get their signatures
+fn get_signatures_for_samples(
+    conn: &Connection,
+    sample_names: &[String]
+) -> Result<HashMap<String, u64>> {
     let start = Instant::now();
-    let mut missing_ids = Vec::new();
+    let mut name_to_sig = HashMap::new();
+    let mut missing_names = Vec::new();
     
-    for id in ids {
-        let exists: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM sketches WHERE sample = ?",
-            [id],
+    for name in sample_names {
+        let sig_opt: Option<u64> = conn.query_row(
+            "SELECT signature FROM sketches WHERE name = ?",
+            [name],
             |row| row.get(0)
-        )?;
+        ).ok();
         
-        if !exists {
-            missing_ids.push(id.clone());
+        if let Some(sig) = sig_opt {
+            name_to_sig.insert(name.clone(), sig as u64);
+        } else {
+            missing_names.push(name.clone());
         }
     }
     
-    if !missing_ids.is_empty() {
+    if !missing_names.is_empty() {
         return Err(anyhow!(
-            "The following {} sample IDs were not found in the database: {}",
-            missing_ids.len(),
-            missing_ids.join(", ")
+            "The following {} sample names were not found in the database: {}",
+            missing_names.len(),
+            missing_names.join(", ")
         ));
     }
     
     let duration = start.elapsed();
-    println!("✓ Verified all {} samples exist in database [{:.2}ms]",
-             ids.len(), duration.as_millis());
+    println!("✓ Verified all {} samples exist and retrieved signatures [{:.2}ms]",
+             sample_names.len(), duration.as_millis());
     
-    Ok(())
+    Ok(name_to_sig)
 }
 
 /// Calculate pairwise distances in long format with optional threshold
 fn calculate_pairwise_distances_long(
     sketch_manager: &SketchManager,
-    ids: &[String],
+    sample_names: &[String],
+    name_to_sig: &HashMap<String, u64>,
     threshold: Option<f64>,
     threads: usize,
     verbose: bool,
 ) -> anyhow::Result<Vec<PairwiseDistance>> {
-    let n = ids.len();
+    let n = sample_names.len();
 
-    // Configurar pool con num_threads y anotar tipo de retorno explícito
+    // Configure thread pool
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
         .context("Error configuring thread pool")?;
 
     let distances: Vec<PairwiseDistance> = pool.install(|| {
-        // Anotar tipo en collect para evitar E0283
         (0..n)
             .into_par_iter()
             .flat_map(|i| {
-                // También podemos anotar el vector intermedio
                 let mut results: Vec<PairwiseDistance> = Vec::new();
+                
+                let sig_i = name_to_sig.get(&sample_names[i])
+                    .expect("Signature not found");
                 let sketch_i = sketch_manager
-                    .get_sketch(&ids[i])
+                    .get_sketch(*sig_i)
                     .expect("Sketch not found");
 
                 for j in (i + 1)..n {
+                    let sig_j = name_to_sig.get(&sample_names[j])
+                        .expect("Signature not found");
                     let sketch_j = sketch_manager
-                        .get_sketch(&ids[j])
+                        .get_sketch(*sig_j)
                         .expect("Sketch not found");
+                    
                     let ani = sketch_i.distance(sketch_j);
 
                     if threshold.map_or(true, |thr| ani >= thr) {
                         results.push(PairwiseDistance {
-                            sample1: ids[i].clone(),
-                            sample2: ids[j].clone(),
+                            sample1: sample_names[i].clone(),
+                            sample2: sample_names[j].clone(),
                             ani,
                         });
                     }
@@ -232,45 +243,47 @@ fn calculate_pairwise_distances_long(
 
                 results
             })
-            .collect::<Vec<PairwiseDistance>>() // <- clave: anotar tipo aquí
+            .collect::<Vec<PairwiseDistance>>()
     });
 
     Ok(distances)
 }
 
-
 /// Calculate pairwise distances as full matrix (for PHYLIP format)
 fn calculate_pairwise_distances_matrix(
     sketch_manager: &SketchManager,
-    ids: &[String],
+    sample_names: &[String],
+    name_to_sig: &HashMap<String, u64>,
     threads: usize,
     verbose: bool,
 ) -> anyhow::Result<Vec<Vec<f64>>> {
-    let n = ids.len();
+    let n = sample_names.len();
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
         .context("Error configuring thread pool")?;
 
-    // Tipo explícito del valor devuelto por install
     let mut matrix: Vec<Vec<f64>> = pool.install(|| {
         (0..n)
             .into_par_iter()
             .map(|i| {
                 let mut row = vec![0.0f64; n];
 
-                // Obtener referencias inmutables locales (no capturar nada no Send)
+                let sig_i = name_to_sig.get(&sample_names[i])
+                    .expect("Signature not found");
                 let sketch_i = sketch_manager
-                    .get_sketch(&ids[i])
+                    .get_sketch(*sig_i)
                     .expect("Sketch not found");
 
                 for j in 0..n {
                     if i == j {
                         row[j] = 1.0;
                     } else if i < j {
+                        let sig_j = name_to_sig.get(&sample_names[j])
+                            .expect("Signature not found");
                         let sketch_j = sketch_manager
-                            .get_sketch(&ids[j])
+                            .get_sketch(*sig_j)
                             .expect("Sketch not found");
                         row[j] = sketch_i.distance(sketch_j);
                     }
@@ -282,10 +295,10 @@ fn calculate_pairwise_distances_matrix(
 
                 row
             })
-            .collect::<Vec<Vec<f64>>>() // <- anotar tipo de collect
+            .collect::<Vec<Vec<f64>>>()
     });
 
-    // Simetrizar el triángulo inferior
+    // Symmetrize lower triangle
     for i in 0..n {
         for j in 0..i {
             matrix[i][j] = matrix[j][i];
@@ -366,7 +379,7 @@ fn save_distances_csv_long(
 /// Save distance matrix in PHYLIP format
 fn save_matrix_phylip(
     output_file: &str,
-    ids: &[String],
+    sample_names: &[String],
     matrix: &[Vec<f64>],
 ) -> Result<()> {
     let start = Instant::now();
@@ -374,7 +387,7 @@ fn save_matrix_phylip(
         .with_context(|| format!("Error creating output file: {}", output_file))?;
     let mut writer = BufWriter::new(file);
     
-    let n = ids.len();
+    let n = sample_names.len();
     
     // Write header (number of taxa)
     writeln!(writer, "{}", n)?;
@@ -382,10 +395,10 @@ fn save_matrix_phylip(
     // Write matrix rows
     // PHYLIP format: first 10 characters for name, then distances
     for (i, row) in matrix.iter().enumerate() {
-        let name = if ids[i].len() > 10 {
-            &ids[i][..10]
+        let name = if sample_names[i].len() > 10 {
+            &sample_names[i][..10]
         } else {
-            &ids[i]
+            &sample_names[i]
         };
         write!(writer, "{:<10}", name)?;
         
@@ -553,11 +566,11 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
     println!("K-mer size: {}", ctx.kmer_size());
     println!("Sketch size: {}", ctx.sketch_size());
     
-    // Read sample IDs
-    let ids = read_sample_ids(&args.ids)?;
+    // Read sample names from file
+    let sample_names = read_sample_names(&args.ids)?;
     
-    // Verify all samples exist in database
-    verify_samples_exist(&conn, &ids)?;
+    // Get signatures for all sample names and verify they exist
+    let name_to_sig = get_signatures_for_samples(&conn, &sample_names)?;
     
     // Load SketchManager from database
     let sketch_load_start = Instant::now();
@@ -571,16 +584,17 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
              sketch_manager.length(),
              sketch_load_start.elapsed().as_secs_f32());
     
-    // Verify all requested samples are in SketchManager
-    let missing_sketches: Vec<&String> = ids.iter()
-        .filter(|id| !sketch_manager.contains(id))
+    // Verify all requested signatures are in SketchManager
+    let missing_sigs: Vec<u64> = name_to_sig.values()
+        .filter(|sig| !sketch_manager.contains(**sig))
+        .copied()
         .collect();
     
-    if !missing_sketches.is_empty() {
+    if !missing_sigs.is_empty() {
         return Err(anyhow!(
-            "The following {} samples have no sketches in the database: {}",
-            missing_sketches.len(),
-            missing_sketches.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            "The following {} signatures have no sketches in SketchManager: {:?}",
+            missing_sigs.len(),
+            missing_sigs
         ));
     }
     
@@ -589,7 +603,8 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
         "tsv" => {
             let distances = calculate_pairwise_distances_long(
                 &sketch_manager,
-                &ids,
+                &sample_names,
+                &name_to_sig,
                 args.threshold,
                 args.threads,
                 args.verbose
@@ -605,7 +620,8 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
         "csv" => {
             let distances = calculate_pairwise_distances_long(
                 &sketch_manager,
-                &ids,
+                &sample_names,
+                &name_to_sig,
                 args.threshold,
                 args.threads,
                 args.verbose
@@ -622,7 +638,8 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
             // PHYLIP requires full matrix, threshold is not applied
             let matrix = calculate_pairwise_distances_matrix(
                 &sketch_manager,
-                &ids,
+                &sample_names,
+                &name_to_sig,
                 args.threads,
                 args.verbose
             )?;
@@ -631,7 +648,7 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
                 stats.print();
             }
             
-            save_matrix_phylip(&args.output, &ids, &matrix)?;
+            save_matrix_phylip(&args.output, &sample_names, &matrix)?;
         }
         
         _ => unreachable!(), // Already validated
