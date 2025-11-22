@@ -562,6 +562,7 @@ pub fn copy_code_full_l_fields_up_to(conn: &Connection, input_sig: u64, ref_sig:
 
 
 
+
 /// Inserts a Sketch into the sketches table using UBIGINT[] array
 /// Inserts a Sketch into the sketches table using UBIGINT[] array
 pub fn insert_sketch_object(
@@ -570,25 +571,28 @@ pub fn insert_sketch_object(
 ) -> Result<()> {
     let sketch_array: Vec<u64> = sketch.hashes().to_vec();
     
-    // Convertir array a bytes para almacenar como binario
-    let array_bytes: Vec<u8> = sketch_array
-        .iter()
-        .flat_map(|&val| val.to_le_bytes().to_vec())
-        .collect();
+    // Convertir array a formato SQL list: [val1, val2, val3, ...]
+    let array_str = format!(
+        "[{}]",
+        sketch_array
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     
-    // Guardar como BLOB y luego CAST a UBIGINT[]
-    let mut stmt = conn.prepare(
-        "INSERT INTO sketches (signature, name, sketch) VALUES (?, ?, ?)"
-    )?;
-    
-    stmt.execute(duckdb::params![
+    // Usar SQL directo porque DuckDB no soporta Vec<u64> en params
+    let sql = format!(
+        "INSERT INTO sketches (signature, name, sketch) VALUES ({}, '{}', {})",
         sketch.signature as u64,
-        &sketch.name,
-        array_bytes
-    ])?;
+        sketch.name.replace("'", "''"),  // Escape comillas simples
+        array_str
+    );
     
+    conn.execute(&sql, [])?;
     Ok(())
 }
+
 
 
 

@@ -229,14 +229,13 @@ pub fn load_sketch_manager_from_db(
     default_kmer_size: usize,
     default_sketch_size: usize
 ) -> Result<SketchManager> {
-    // 1. Get all data sequentially from the new array-based schema
-    let mut stmt = conn.prepare("SELECT signature, name, sketch FROM sketches")?;
+    // 1. Get all data sequentially - read array as string
+    let mut stmt = conn.prepare("SELECT signature, name, CAST(sketch AS VARCHAR) as sketch_str FROM sketches")?;
     let rows = stmt.query_map([], |row| {
         let signature: u64 = row.get(0)?;
         let name: String = row.get(1)?;
-        // Leer como Vec<u8> (bytes) porque DuckDB no soporta Vec<u64> directamente
-        let sketch_data: Vec<u8> = row.get(2)?;
-        Ok((signature, name, sketch_data))
+        let sketch_str: String = row.get(2)?;  // Array como string: "[1, 2, 3, ...]"
+        Ok((signature, name, sketch_str))
     })?;
 
     // 2. Gather in a Vec for parallelization
@@ -255,14 +254,12 @@ pub fn load_sketch_manager_from_db(
     // 3. Parallelize Sketch object construction
     let sketches: HashMap<u64, Sketch> = raw_data
         .into_par_iter()
-        .map(|(signature, name, sketch_data)| {
-            // Convertir Vec<u8> a Vec<u64> (8 bytes por u64)
-            let sketch_array: Vec<u64> = sketch_data
-                .chunks_exact(8)
-                .map(|chunk| u64::from_le_bytes([
-                    chunk[0], chunk[1], chunk[2], chunk[3],
-                    chunk[4], chunk[5], chunk[6], chunk[7],
-                ]))
+        .map(|(signature, name, sketch_str)| {
+            // Parse string "[1, 2, 3, ...]" to Vec<u64>
+            let sketch_array: Vec<u64> = sketch_str
+                .trim_matches(|c| c == '[' || c == ']')  // Remove brackets
+                .split(',')
+                .filter_map(|s| s.trim().parse::<u64>().ok())
                 .collect();
             
             // Reconstruct Sketch from array data
