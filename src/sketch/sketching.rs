@@ -2,7 +2,6 @@ use needletail::parser::parse_fastx_file;
 use needletail::sequence::Sequence;
 use nthash::NtHashIterator;
 use hashbrown::HashMap;
-use bincode;
 use serde::*;
 use std::fs::File;
 use std::io::{BufWriter,BufReader};
@@ -13,10 +12,12 @@ use twox_hash::XxHash64;
 use std::hash::Hasher; 
 
 
+
 use std::{
     error::Error,
     path::Path,
 };
+
 
 /// Structure that represents a sketch of a biological sequence
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +34,15 @@ pub struct Sketch {
     pub signature: u64,
 }
 
+// Alias for compatibility with db.rs
+// This allows db.rs to use sketch.hashes while keeping internal field as sketch.sketch
+impl Sketch {
+    pub fn hashes(&self) -> &[u64] {
+        &self.sketch
+    }
+}
+
+
 impl Sketch {
     /// Creates a new sketch from a FASTA file
     pub fn new<P: AsRef<Path>>(
@@ -43,6 +53,7 @@ impl Sketch {
         // Generate the sketch using the binwise_minhash function
         let sketch = binwise_minhash(&fasta_path, kmer_size, sketch_size)?;
 
+
         // Extract the filename without extension
         let name = fasta_path
             .as_ref()
@@ -51,8 +62,10 @@ impl Sketch {
             .unwrap_or("unknown")
             .to_string();
 
+
         // Calculate signature from sketch vector
         let signature = compute_sketch_signature(&sketch);
+
 
         Ok(Sketch {
             sketch,
@@ -63,15 +76,18 @@ impl Sketch {
         })
     }
 
+
     /// Computes the Mash distance between this sketch and another
     pub fn distance(&self, other: &Sketch) -> f64 {
         jaccard_index(&self.sketch, &other.sketch, self.kmer_size)
     }
 
+
     /// Checks if two sketches are compatible for comparison
     pub fn is_compatible(&self, other: &Sketch) -> bool {
         self.kmer_size == other.kmer_size && self.sketch_size == other.sketch_size
     }
+
 
     /// Gets basic information about the sketch
     pub fn info(&self) -> String {
@@ -86,6 +102,7 @@ impl Sketch {
     }
 }
 
+
 /// Container to manage multiple sketches
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SketchManager {
@@ -94,6 +111,7 @@ pub struct SketchManager {
     pub default_kmer_size: usize,
     pub default_sketch_size: usize,
 }
+
 
 impl SketchManager {
     /// 1. Initializes an empty HashMap to store sketches
@@ -105,22 +123,27 @@ impl SketchManager {
         }
     }
 
+
     pub fn length(&self) -> usize {
         self.sketches.len()
     }
 
+
     /// 2. Adds a new sketch to the HashMap
     pub fn add_sketch(&mut self, sketch: Sketch) -> Result<()> {
         let signature = sketch.signature;
+
 
         // ✅ Check if signature already exists
         if self.sketches.contains_key(&signature) {
             bail!("Sketch with signature '{}' already exists", signature);
         }
 
+
         self.sketches.insert(signature, sketch);
         Ok(())
     }
+
 
     /// Adds a sketch from a FASTA file
     pub fn add_sketch_from_file<P: AsRef<Path>>(
@@ -133,71 +156,87 @@ impl SketchManager {
         self.add_sketch(sketch)
     }
 
+
     /// Gets a sketch by signature
     pub fn get_sketch(&self, signature: u64) -> Option<&Sketch> {
         self.sketches.get(&signature)
     }
+
 
     /// Gets a sketch by name (helper function)
     pub fn get_sketch_by_name(&self, name: &str) -> Option<&Sketch> {
         self.sketches.values().find(|s| s.name == name)
     }
 
+
     /// Removes a sketch by signature
     pub fn remove_sketch(&mut self, signature: u64) -> Option<Sketch> {
         self.sketches.remove(&signature)
     }
+
 
     /// Lists all available sketch names
     pub fn list_sketches(&self) -> Vec<String> {
         self.sketches.values().map(|s| s.name.clone()).collect()
     }
 
+
     /// Lists all available sketch signatures
     pub fn list_signatures(&self) -> Vec<u64> {
         self.sketches.keys().cloned().collect()
     }
+
 
     /// Gets the number of stored sketches
     pub fn count(&self) -> usize {
         self.sketches.len()
     }
 
+
     pub fn contains(&self, signature: u64) -> bool {
         self.sketches.contains_key(&signature)
     }
 
+
     pub fn contains_by_name(&self, name: &str) -> bool {
         self.sketches.values().any(|s| s.name == name)
     }
+
 
     /// Calculates the distance between two sketches by signature
     pub fn distance_between(&self, sig1: u64, sig2: u64) -> Result<f64> {
         let sketch1 = self.sketches.get(&sig1)
             .ok_or_else(|| anyhow!("Sketch with signature '{}' not found", sig1))?;
 
+
         let sketch2 = self.sketches.get(&sig2)
             .ok_or_else(|| anyhow!("Sketch with signature '{}' not found", sig2))?;
+
 
         if !sketch1.is_compatible(sketch2) {
             anyhow::bail!("Sketches are not compatible (different k-mer or sketch size)");
         }
 
+
         Ok(sketch1.distance(sketch2))
     }
 }
 
+
+/// Loads SketchManager from database using UBIGINT[] arrays instead of BLOB
 pub fn load_sketch_manager_from_db(
     conn: &Connection,
     default_kmer_size: usize,
     default_sketch_size: usize
 ) -> Result<SketchManager> {
-    // 1. Get all serialized data sequentially
-    let mut stmt = conn.prepare("SELECT signature, sketch FROM sketches")?;
+    // 1. Get all data sequentially from the new array-based schema
+    let mut stmt = conn.prepare("SELECT signature, name, sketch FROM sketches")?;
     let rows = stmt.query_map([], |row| {
         let signature: u64 = row.get(0)?;
-        let sketch_data: Vec<u8> = row.get(1)?;
-        Ok((signature, sketch_data))
+        let name: String = row.get(1)?;
+        // Leer como Vec<u8> (bytes) porque DuckDB no soporta Vec<u64> directamente
+        let sketch_data: Vec<u8> = row.get(2)?;
+        Ok((signature, name, sketch_data))
     })?;
 
     // 2. Gather in a Vec for parallelization
@@ -213,15 +252,30 @@ pub fn load_sketch_manager_from_db(
         });
     }
 
-    // 3. Parallelize deserialization and HashMap construction
+    // 3. Parallelize Sketch object construction
     let sketches: HashMap<u64, Sketch> = raw_data
         .into_par_iter()
-        .map(|(signature, sketch_data)| {
-            let sketch: Sketch = bincode::deserialize(&sketch_data)
-                .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
+        .map(|(signature, name, sketch_data)| {
+            // Convertir Vec<u8> a Vec<u64> (8 bytes por u64)
+            let sketch_array: Vec<u64> = sketch_data
+                .chunks_exact(8)
+                .map(|chunk| u64::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3],
+                    chunk[4], chunk[5], chunk[6], chunk[7],
+                ]))
+                .collect();
+            
+            // Reconstruct Sketch from array data
+            let sketch = Sketch {
+                signature,
+                name,
+                sketch: sketch_array,
+                kmer_size: default_kmer_size,
+                sketch_size: default_sketch_size,
+            };
             Ok((signature, sketch))
         })
-        .collect::<Result<HashMap<_, _>, duckdb::Error>>()?;
+        .collect::<Result<HashMap<_, _>, anyhow::Error>>()?;
 
     // 4. Construct the SketchManager
     Ok(SketchManager {
@@ -230,6 +284,7 @@ pub fn load_sketch_manager_from_db(
         default_sketch_size,
     })
 }
+
 
 /// Constructs a binwise sketch
 /// - Uses direct binning instead of heap O(log S).
@@ -247,10 +302,12 @@ pub fn binwise_minhash<P: AsRef<Path>>(
     // Array of minimums per bin
     let mut signs = vec![u64::MAX; bins];
 
+
     let mut reader = parse_fastx_file(fasta_path)?;
     while let Some(record) = reader.next() {
         let seqrec = record?;
         let seq_bytes = seqrec.normalize(false);
+
 
         // Rolling-hash streaming
         let mut iter = NtHashIterator::new(&seq_bytes, k)?;
@@ -266,6 +323,7 @@ pub fn binwise_minhash<P: AsRef<Path>>(
     Ok(signs)
 }
 
+
 /// Computes xxHash64 signature of a sketch vector
 /// This function creates a unique identifier for each sketch
 fn compute_sketch_signature(sketch: &[u64]) -> u64 {
@@ -279,6 +337,7 @@ fn compute_sketch_signature(sketch: &[u64]) -> u64 {
     hasher.finish()
 }
 
+
 /// Calculates the Jaccard index between two sketches and converts it to ANI.
 /// - `sketch1` and `sketch2`: Vectors of minimum hashes
 /// - `kmer_size`: Size of the k-mers used for the sketch.
@@ -287,12 +346,15 @@ fn compute_sketch_signature(sketch: &[u64]) -> u64 {
 pub fn jaccard_index(sketch1: &[u64], sketch2: &[u64], kmer_size: usize) -> f64 {
     assert_eq!(sketch1.len(), sketch2.len(), "Sketches must have the same size.");
 
+
     let matches = sketch1.iter()
         .zip(sketch2.iter())
         .filter(|(a, b)| a == b)
         .count();
 
+
     let jaccard_value = matches as f64 / sketch1.len() as f64;
+
 
     if jaccard_value == 0.0 {
         return 0.0; // Minimum similarity
@@ -300,13 +362,16 @@ pub fn jaccard_index(sketch1: &[u64], sketch2: &[u64], kmer_size: usize) -> f64 
         // Compute Mash distance: D = -1/k * ln(2j/(1+j))
         let mash_distance = -((2.0 * jaccard_value) / (1.0 + jaccard_value)).ln() / kmer_size as f64;
 
+
         // Convert Mash distance to ANI
         let ani = 1.0 - mash_distance;
+
 
         // Make sure ANI is in [0, 1] range
         return ani.max(0.0).min(1.0);
     }
 }
+
 
 /// Compares the query_manager sketches against a specific subset of sketches 
 /// in reference_manager, only returning those comparisons with distance > min_dist.
@@ -338,6 +403,7 @@ pub fn pw_one_to_many(
         }).collect::<Vec<_>>()
     }).collect()
 }
+
 
 /// Compares all sketches in `query_manager` against all in `reference_manager`
 /// in parallel, only returning comparisons with distance < max_dist.
