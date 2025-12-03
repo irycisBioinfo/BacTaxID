@@ -18,24 +18,24 @@ Applied to **2.3 million genomes** across 67 genera, BacTaxID demonstrates:
 
 ## Key Features
 
-### 🚀 **High-Performance Sketching**
+### **High-Performance Sketching**
 - **BinDash Algorithm**: Direct binning eliminates heap operations (O(log S) vs O(S log S))
 - **ntHash Streaming**: Rolling-hash k-mer decomposition without materialization
 - **Parallel Processing**: Rayon-powered multi-threaded distance computations
 
-### 🗄️ **Optimized Database Architecture**
+### **Optimized Database Architecture**
 - **Signature-based Indexing**: xxHash64 u64 signatures for unique genome identification
 - **UBIGINT[] Sketch Storage**: Native SQL arrays to universal usage
 - **Automatic Duplicate Detection**: `duplicates` table links identical sketches
 - **DuckDB Backend**: Self-contained portable database with SQL/Python/R/CLI APIs
 
-### 🧬 **Advanced Typing System**
+### **Advanced Typing System**
 - **Pseudo-Clique Clustering**: Prevents chaining artifacts via click_threshold criterion
 - **Hierarchical Resolution**: L₀ (96% ANI) → L₅ (99.99% ANI) configurable levels
 - **Classifier/Satellite States**: Robust reference management avoiding chain effects
 - **Monotonicity Constraints**: Ensures hierarchical consistency across levels
 
-### 📊 **Intelligent Clustering**
+### **Intelligent Clustering**
 - **Maximal Clique Detection**: PetGraph-based complete subgraph identification
 - **ANI-based Thresholds**: Direct quantitative link to Average Nucleotide Identity
 - **Reference Community Detection**: Size-based optimization (reference_size parameter)
@@ -243,8 +243,8 @@ cargo build --release
 ```
 
 **Pre-compiled binaries** and **67 pre-computed genus schemes** available at:
-- 🌐 **www.bactaxid.org** (interactive tools, KronaPlots)
-- 📦 **zenodo.org/doi/10.5281/zenodo.17226627** (classification data)
+- **www.bactaxid.org** (interactive tools, KronaPlots)
+- **zenodo.org/doi/10.5281/zenodo.17226627** (classification data)
 
 ## Citation
 
