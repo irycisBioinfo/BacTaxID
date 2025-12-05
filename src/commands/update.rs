@@ -5,7 +5,8 @@ use std::fs;
 use std::path::Path;
 use std::time::Instant;
 use rayon::prelude::*;
-use duckdb::{Connection, Row, ToSql, params, Result as DuckResult};
+use rayon::ThreadPoolBuilder; 
+use duckdb::{Connection, Row, ToSql, params, params_from_iter, Result as DuckResult};
 
 use crate::graph::exists_clique;
 use crate::{
@@ -658,32 +659,36 @@ pub fn update_duckdb(
     let sample = &query.sample_name;
     let n = query.code.len();
 
-    // First, insert empty row if not exists
-    conn.execute(
-        "INSERT OR IGNORE INTO code (signature, sample) VALUES (?, ?)",
-        params![signature, sample],
-    )?;
-
-    // Now update all level columns
+    // Construir la lista de columnas dinámicamente
+    let mut columns = vec!["signature".to_string(), "sample".to_string()];
+    
+    // Build parameter placeholders and values
+    let mut placeholders = vec!["?".to_string(); 2 + n * 3];
+    let mut params: Vec<Box<dyn ToSql>> = Vec::new();
+    
+    params.push(Box::new(signature));
+    params.push(Box::new(sample));
+    
     for i in 0..n {
-        let int_col = format!("L_{}_int", i);
-        let full_col = format!("L_{}_full", i);
-        let state_col = format!("L_{}_state", i);
+        columns.push(format!("L_{}_int", i));
+        columns.push(format!("L_{}_full", i));
+        columns.push(format!("L_{}_state", i));
         
-        conn.execute(
-            &format!(
-                "UPDATE code SET {} = ?, {} = ?, {} = ? WHERE signature = ?",
-                int_col, full_col, state_col
-            ),
-            params![
-                query.code[i] as u64,
-                &query.code_full[i],
-                &query.code_state[i],
-                signature
-            ],
-        )?;
+        params.push(Box::new(query.code[i] as u64));
+        params.push(Box::new(&query.code_full[i]));
+        params.push(Box::new(&query.code_state[i]));
     }
-
+    
+    let sql = format!(
+        "INSERT OR REPLACE INTO code ({}) VALUES ({})",
+        columns.join(", "),
+        placeholders.join(", ")
+    );
+    
+    // Convert Box<dyn ToSql> to &dyn ToSql for execution
+    let param_refs: Vec<&dyn ToSql> = params.iter().map(|p| &**p).collect();
+    conn.execute(&sql, param_refs.as_slice())?;
+    
     Ok(())
 }
 
@@ -909,6 +914,16 @@ pub fn update_command(args: &UpdateArgs) -> Result<()> {
     println!("CPUs: {}", args.cpus);
     println!("Debug: {}", args.debug);
 
+       // ✅ CONFIGURAR RAYON CON EL NÚMERO DE CPUS ESPECIFICADO
+    ThreadPoolBuilder::new()
+        .num_threads(args.cpus)
+        .build_global()
+        .context("Error configuring Rayon thread pool")?;
+    
+    let actual_threads = rayon::current_num_threads();
+    println!("✓ Rayon thread pool configured with {} threads (affects all parallel operations)", 
+             actual_threads);
+             
     // Check that files exist
     let validation_start = Instant::now();
     if !Path::new(&args.db).exists() {

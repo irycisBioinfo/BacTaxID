@@ -32,28 +32,19 @@ impl DuckDb {
     }
 
 
-    /// Dynamically creates the sketches table based on sketch_size from metadata table
     pub fn init_sketches_table(&self) -> Result<()> {
-        // Get sketch_size from metadata table
-        let sketch_size: i32 = self.conn.query_row(
-            "SELECT sketch_size FROM metadata LIMIT 1",
-            [],
-            |row| row.get(0)
-        )?;
-
-        // Build SQL with dynamic array size
-        let schema_sql = format!(
-            "CREATE TABLE IF NOT EXISTS sketches (
+        let schema_sql = "
+            CREATE TABLE IF NOT EXISTS sketches (
                 signature UBIGINT PRIMARY KEY,
                 name VARCHAR,
-                sketch UBIGINT[{}]
-            );",
-            sketch_size
-        );
+                sketch BLOB
+            );
+        ";
         
-        self.conn.execute_batch(&schema_sql)?;
+        self.conn.execute_batch(schema_sql)?;
         Ok(())
     }
+
 
 
     /// Adds a Sketch to the sketches table
@@ -102,7 +93,7 @@ impl DuckDb {
     pub fn init_duplicates_table(&self) -> Result<()> {
         let schema_sql = "
             CREATE TABLE IF NOT EXISTS duplicates (
-                signature UBIGINT REFERENCES code(signature),
+                signature UBIGINT,
                 sample VARCHAR
             );
         ";
@@ -560,36 +551,26 @@ pub fn copy_code_full_l_fields_up_to(conn: &Connection, input_sig: u64, ref_sig:
 }
 
 
-
-
-
-/// Inserts a Sketch into the sketches table using UBIGINT[] array
-/// Inserts a Sketch into the sketches table using UBIGINT[] array
 pub fn insert_sketch_object(
     conn: &Connection,
     sketch: &Sketch
 ) -> Result<()> {
-    let sketch_array: Vec<u64> = sketch.hashes().to_vec();
+    // Serialize the entire sketch using bincode
+    let sketch_blob = bincode::serialize(sketch)
+        .map_err(|e| duckdb::Error::ToSqlConversionFailure(
+            format!("Bincode serialization error: {}", e).into()
+        ))?;
     
-    // Convertir array a formato SQL list: [val1, val2, val3, ...]
-    let array_str = format!(
-        "[{}]",
-        sketch_array
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    );
+    // Use prepared statement with params (more secure)
+    conn.execute(
+        "INSERT INTO sketches (signature, name, sketch) VALUES (?, ?, ?)",
+        params![
+            sketch.signature as u64,
+            &sketch.name,
+            &sketch_blob  // Vec<u8> → BLOB
+        ],
+    )?;
     
-    // Usar SQL directo porque DuckDB no soporta Vec<u64> en params
-    let sql = format!(
-        "INSERT INTO sketches (signature, name, sketch) VALUES ({}, '{}', {})",
-        sketch.signature as u64,
-        sketch.name.replace("'", "''"),  // Escape comillas simples
-        array_str
-    );
-    
-    conn.execute(&sql, [])?;
     Ok(())
 }
 
@@ -651,34 +632,26 @@ mod tests {
 
 
     #[test]
-    fn test_sketches_table_initialization() {
-        let db = DuckDb::new(":memory:").expect("Could not create database");
-        
-        // First insert metadata (required for sketches table)
-        db.init_metadata_table().expect("Could not create metadata table");
-        db.conn.execute(
-            "INSERT INTO metadata (sketch_size) VALUES (?)",
-            params![4000]
-        ).expect("Could not insert metadata");
-        
-        db.init_sketches_table().expect("Could not create sketches table");
+   #[test]
+fn test_sketches_table_initialization() {
+    let db = DuckDb::new(":memory:").expect("Could not create database");
+    
+    // ✅ Ya no necesita metadata table
+    db.init_sketches_table().expect("Could not create sketches table");
 
+    let columns_check = "SELECT column_name FROM information_schema.columns WHERE table_name = 'sketches' ORDER BY ordinal_position";
+    let mut stmt = db.conn.prepare(columns_check).expect("Error preparing query");
+    let mut rows = stmt.query([]).expect("Error running query");
 
-        // Check that the sketches table was created correctly
-        let columns_check = "SELECT column_name FROM information_schema.columns WHERE table_name = 'sketches' ORDER BY ordinal_position";
-        let mut stmt = db.conn.prepare(columns_check).expect("Error preparing query");
-        let mut rows = stmt.query([]).expect("Error running query");
-
-
-        let mut columns = Vec::new();
-        while let Some(row) = rows.next().expect("Error reading row") {
-            let column_name: String = row.get(0).expect("Error getting column_name");
-            columns.push(column_name);
-        }
-
-
-        assert_eq!(columns, vec!["signature", "name", "sketch"]);
+    let mut columns = Vec::new();
+    while let Some(row) = rows.next().expect("Error reading row") {
+        let column_name: String = row.get(0).expect("Error getting column_name");
+        columns.push(column_name);
     }
+
+    assert_eq!(columns, vec!["signature", "name", "sketch"]);
+}
+
 
 
     #[test]

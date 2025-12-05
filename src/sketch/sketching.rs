@@ -223,19 +223,17 @@ impl SketchManager {
 }
 
 
-/// Loads SketchManager from database using UBIGINT[] arrays instead of BLOB
+/// Loads SketchManager from database using BLOB
 pub fn load_sketch_manager_from_db(
     conn: &Connection,
     default_kmer_size: usize,
     default_sketch_size: usize
 ) -> Result<SketchManager> {
-    // 1. Get all data sequentially - read array as string
-    let mut stmt = conn.prepare("SELECT signature, name, CAST(sketch AS VARCHAR) as sketch_str FROM sketches")?;
+    // 1. Get all data sequentially - read BLOB directly
+    let mut stmt = conn.prepare("SELECT sketch FROM sketches")?;
     let rows = stmt.query_map([], |row| {
-        let signature: u64 = row.get(0)?;
-        let name: String = row.get(1)?;
-        let sketch_str: String = row.get(2)?;  // Array como string: "[1, 2, 3, ...]"
-        Ok((signature, name, sketch_str))
+        let sketch_blob: Vec<u8> = row.get(0)?;
+        Ok(sketch_blob)
     })?;
 
     // 2. Gather in a Vec for parallelization
@@ -251,26 +249,15 @@ pub fn load_sketch_manager_from_db(
         });
     }
 
-    // 3. Parallelize Sketch object construction
+    // 3. Parallelize Sketch deserialization
     let sketches: HashMap<u64, Sketch> = raw_data
         .into_par_iter()
-        .map(|(signature, name, sketch_str)| {
-            // Parse string "[1, 2, 3, ...]" to Vec<u64>
-            let sketch_array: Vec<u64> = sketch_str
-                .trim_matches(|c| c == '[' || c == ']')  // Remove brackets
-                .split(',')
-                .filter_map(|s| s.trim().parse::<u64>().ok())
-                .collect();
+        .map(|sketch_blob| {
+            // Deserialize Sketch directly with bincode
+            let sketch: Sketch = bincode::deserialize(&sketch_blob)
+                .map_err(|e| anyhow!("Bincode deserialization error: {}", e))?;
             
-            // Reconstruct Sketch from array data
-            let sketch = Sketch {
-                signature,
-                name,
-                sketch: sketch_array,
-                kmer_size: default_kmer_size,
-                sketch_size: default_sketch_size,
-            };
-            Ok((signature, sketch))
+            Ok((sketch.signature, sketch))
         })
         .collect::<Result<HashMap<_, _>, anyhow::Error>>()?;
 
@@ -281,6 +268,7 @@ pub fn load_sketch_manager_from_db(
         default_sketch_size,
     })
 }
+
 
 
 /// Constructs a binwise sketch

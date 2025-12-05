@@ -6,6 +6,8 @@ use std::path::Path;
 use std::time::Instant;
 use std::io::Write;
 use duckdb::{Connection, Row, ToSql, params, Result as DuckResult};
+use rayon::ThreadPoolBuilder;
+use rayon::prelude::*;
 use crate::{
     sketch::sketching::*,
     db::db::*,
@@ -23,6 +25,9 @@ pub struct ClassifyArgs {
     /// Output file for classification results (optional)
     #[arg(long, required = true, value_name = "OUTPUT_FILE")]
     pub output: Option<String>,
+    /// Number of CPUs to parallelize with rayon
+    #[arg(long, value_name = "NCPUS", default_value_t = 1)]
+    pub cpus: usize,
     /// Enable verbose output
     #[arg(long)]
     pub verbose: bool,
@@ -608,6 +613,16 @@ pub fn classify_command(args: &ClassifyArgs) -> Result<()> {
     if let Some(ref output) = args.output {
         println!("Output file: {}", output);
     }
+
+    // ✅ CONFIGURAR RAYON CON EL NÚMERO DE CPUS ESPECIFICADO
+    ThreadPoolBuilder::new()
+        .num_threads(args.cpus)
+        .build_global()
+        .context("Error configuring Rayon thread pool")?;
+    
+    let actual_threads = rayon::current_num_threads();
+    println!("✓ Rayon thread pool configured with {} threads (affects all parallel operations)", 
+             actual_threads);
     
     // Check that files exist
     let validation_start = Instant::now();

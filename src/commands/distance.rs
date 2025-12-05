@@ -7,6 +7,7 @@ use std::path::Path;
 use std::time::Instant;
 use duckdb::Connection;
 use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
 
 use crate::{
     sketch::sketching::*,
@@ -38,9 +39,9 @@ pub struct DistanceArgs {
     #[arg(long, value_name = "THRESHOLD")]
     pub threshold: Option<f64>,
 
-    /// Number of threads for parallel computation
-    #[arg(long, default_value_t = 1, value_name = "THREADS")]
-    pub threads: usize,
+    /// Number of CPUs to parallelize with rayon
+    #[arg(long, value_name = "NCPUS", default_value_t = 1)]
+    pub cpus: usize,
 
     /// Enable verbose output
     #[arg(long)]
@@ -260,68 +261,63 @@ fn calculate_pairwise_distances_long(
     sample_names: &[String],
     sample_map: &HashMap<String, SampleLocation>,
     threshold: Option<f64>,
-    threads: usize,
+    cpus: usize,
     verbose: bool,
 ) -> anyhow::Result<Vec<PairwiseDistance>> {
     let n = sample_names.len();
 
-    // Configure thread pool
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()
-        .context("Error configuring thread pool")?;
+   
 
-    let distances: Vec<PairwiseDistance> = pool.install(|| {
-        (0..n)
-            .into_par_iter()
-            .flat_map(|i| {
-                let mut results: Vec<PairwiseDistance> = Vec::new();
-                
-                // Get signature for sample i (might be from duplicate)
-                let loc_i = sample_map.get(&sample_names[i]).expect("Sample not in map");
-                let sig_i = match loc_i {
+    let distances: Vec<PairwiseDistance> = (0..n)
+        .into_par_iter()  // ✅ Usa automáticamente el pool global
+        .flat_map(|i| {
+            let mut results: Vec<PairwiseDistance> = Vec::new();
+            
+            // Get signature for sample i (might be from duplicate)
+            let loc_i = sample_map.get(&sample_names[i]).expect("Sample not in map");
+            let sig_i = match loc_i {
+                SampleLocation::InSketches { signature } => *signature,
+                SampleLocation::InDuplicates { original_signature, .. } => *original_signature,
+            };
+            
+            let sketch_i = sketch_manager
+                .get_sketch(sig_i)
+                .expect("Sketch not found");
+
+            for j in (i + 1)..n {
+                // Get signature for sample j
+                let loc_j = sample_map.get(&sample_names[j]).expect("Sample not in map");
+                let sig_j = match loc_j {
                     SampleLocation::InSketches { signature } => *signature,
                     SampleLocation::InDuplicates { original_signature, .. } => *original_signature,
                 };
                 
-                let sketch_i = sketch_manager
-                    .get_sketch(sig_i)
+                let sketch_j = sketch_manager
+                    .get_sketch(sig_j)
                     .expect("Sketch not found");
+                
+                let ani = sketch_i.distance(sketch_j);
 
-                for j in (i + 1)..n {
-                    // Get signature for sample j
-                    let loc_j = sample_map.get(&sample_names[j]).expect("Sample not in map");
-                    let sig_j = match loc_j {
-                        SampleLocation::InSketches { signature } => *signature,
-                        SampleLocation::InDuplicates { original_signature, .. } => *original_signature,
-                    };
-                    
-                    let sketch_j = sketch_manager
-                        .get_sketch(sig_j)
-                        .expect("Sketch not found");
-                    
-                    let ani = sketch_i.distance(sketch_j);
-
-                    if threshold.map_or(true, |thr| ani >= thr) {
-                        results.push(PairwiseDistance {
-                            sample1: sample_names[i].clone(),
-                            sample2: sample_names[j].clone(),
-                            ani,
-                        });
-                    }
+                if threshold.map_or(true, |thr| ani >= thr) {
+                    results.push(PairwiseDistance {
+                        sample1: sample_names[i].clone(),
+                        sample2: sample_names[j].clone(),
+                        ani,
+                    });
                 }
+            }
 
-                if verbose && (i + 1) % 10 == 0 {
-                    println!("  Progress: {}/{} samples processed", i + 1, n);
-                }
+            if verbose && (i + 1) % 10 == 0 {
+                println!("  Progress: {}/{} samples processed", i + 1, n);
+            }
 
-                results
-            })
-            .collect::<Vec<PairwiseDistance>>()
-    });
+            results
+        })
+        .collect::<Vec<PairwiseDistance>>();  // ✅ Cierre movido aquí
 
-    Ok(distances)
-}
+
+        Ok(distances)
+    }
 
 /// Calculate pairwise distances as full matrix with duplicate handling
 fn calculate_pairwise_distances_matrix(
@@ -583,13 +579,23 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
     println!("IDs file: {}", args.ids);
     println!("Output file: {}", args.output);
     println!("Format: {}", args.format);
-    println!("Threads: {}", args.threads);
+    println!("CPUs: {}", args.cpus);
     
     if let Some(thr) = args.threshold {
         println!("ANI Threshold: >= {:.4} ({:.2}%)", thr, thr * 100.0);
     } else {
         println!("ANI Threshold: None (all pairs will be reported)");
     }
+
+           // ✅ CONFIGURAR RAYON CON EL NÚMERO DE CPUS ESPECIFICADO
+    ThreadPoolBuilder::new()
+        .num_threads(args.cpus)
+        .build_global()
+        .context("Error configuring Rayon thread pool")?;
+    
+    let actual_threads = rayon::current_num_threads();
+    println!("✓ Rayon thread pool configured with {} threads (affects all parallel operations)", 
+             actual_threads);
     
     // Validate input files
     let validation_start = Instant::now();
@@ -689,7 +695,7 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
                 &sample_names,
                 &sample_map,
                 args.threshold,
-                args.threads,
+                args.cpus,
                 args.verbose
             )?;
             
@@ -706,7 +712,7 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
                 &sample_names,
                 &sample_map,
                 args.threshold,
-                args.threads,
+                args.cpus,
                 args.verbose
             )?;
             
@@ -722,7 +728,7 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
                 &sketch_manager,
                 &sample_names,
                 &sample_map,
-                args.threads,
+                args.cpus,
                 args.verbose
             )?;
             
