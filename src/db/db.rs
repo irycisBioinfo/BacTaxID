@@ -94,7 +94,8 @@ impl DuckDb {
         let schema_sql = "
             CREATE TABLE IF NOT EXISTS duplicates (
                 signature UBIGINT,
-                sample VARCHAR
+                sample VARCHAR,
+                UNIQUE(signature, sample)
             );
         ";
         self.conn.execute_batch(schema_sql)?;

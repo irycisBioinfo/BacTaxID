@@ -256,7 +256,7 @@ pub fn update_single_file(
                 );
                 let duplicate_insert_start = Instant::now();
                 ctx.connection_mut().execute(
-                    "INSERT INTO duplicates (signature, sample) VALUES (?, ?)",
+                    "INSERT OR IGNORE INTO duplicates (signature, sample) VALUES (?, ?)",
                     params![query.signature as u64, query.sample_name],
                 ).with_context(|| format!("Error inserting duplicate for sample: {}", query.sample_name))?;
                 println!(
