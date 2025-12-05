@@ -1,5 +1,4 @@
 use clap::{Parser, Subcommand};
-use std::process;
 use anyhow::{Context, Result};
 
 mod db;
@@ -7,7 +6,7 @@ mod sketch;
 mod graph;
 mod commands;
 
-use commands::{init_command, update_command, verify_init_files,distance_command};  // AÑADIR
+use commands::{init_command, update_command, verify_init_files};  // AÑADIR
 use commands::update::UpdateArgs;
 use commands::classify::ClassifyArgs;
 use commands::distance::DistanceArgs;  // AÑADIR

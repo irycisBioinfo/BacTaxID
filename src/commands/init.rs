@@ -3,7 +3,6 @@
 use crate::db::db::{DuckDb, MetadataConfig};
 
 use anyhow::{Context, Result};
-use duckdb::Result as DuckResult;
 use std::fs;
 use std::path::Path;
 

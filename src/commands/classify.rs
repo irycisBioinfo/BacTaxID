@@ -5,13 +5,10 @@ use std::fs;
 use std::path::Path;
 use std::time::Instant;
 use std::io::Write;
-use duckdb::{Connection, Row, ToSql, params, Result as DuckResult};
+use duckdb::Connection;
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
-use crate::{
-    sketch::sketching::*,
-    db::db::*,
-};
+use crate::sketch::sketching::*;
 
 /// Arguments for the classify subcommand
 #[derive(Args, Debug)]

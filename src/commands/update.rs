@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::Instant;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder; 
-use duckdb::{Connection, Row, ToSql, params, params_from_iter, Result as DuckResult};
+use duckdb::{Connection, ToSql, params, Result as DuckResult};
 
 use crate::graph::exists_clique;
 use crate::{
@@ -663,7 +663,7 @@ pub fn update_duckdb(
     let mut columns = vec!["signature".to_string(), "sample".to_string()];
     
     // Build parameter placeholders and values
-    let mut placeholders = vec!["?".to_string(); 2 + n * 3];
+    let placeholders = vec!["?".to_string(); 2 + n * 3];
     let mut params: Vec<Box<dyn ToSql>> = Vec::new();
     
     params.push(Box::new(signature));

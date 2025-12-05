@@ -3,20 +3,15 @@ use needletail::sequence::Sequence;
 use nthash::NtHashIterator;
 use hashbrown::HashMap;
 use serde::*;
-use std::fs::File;
-use std::io::{BufWriter,BufReader};
 use rayon::prelude::*;
-use anyhow::{Result, Context, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use duckdb::Connection;
 use twox_hash::XxHash64; 
 use std::hash::Hasher; 
 
 
 
-use std::{
-    error::Error,
-    path::Path,
-};
+use std::path::Path;
 
 
 /// Structure that represents a sketch of a biological sequence

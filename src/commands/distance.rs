@@ -9,10 +9,7 @@ use duckdb::Connection;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 
-use crate::{
-    sketch::sketching::*,
-    db::db::*,
-};
+use crate::sketch::sketching::*;
 
 /// Arguments for the distance subcommand
 #[derive(Args, Debug)]

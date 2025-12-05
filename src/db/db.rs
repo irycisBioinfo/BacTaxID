@@ -2,7 +2,7 @@ use duckdb::{Connection, Result, params, params_from_iter};
 use serde::Deserialize;
 use std::fs;
 use crate::sketch::sketching::*;
-use anyhow::{Result as AnyResult, Context, bail, anyhow};
+use anyhow::{Result as AnyResult, Context, bail};
 
 
 #[derive(Deserialize, Debug)]
