@@ -1,11 +1,11 @@
 [package]
 name = "bactaxid"
-version = "0.1.0"
+version = "1.1.0"
 edition = "2021"
-authors = ["Tu Nombre <tu.email@example.com>"]
+authors = ["Val F. Lanza <valfernandez.vf@gmail.com>, Miguel Diez Fernandez de Bobadilla <migueldiez@outlook.com >"]
 description = "A fast bacterial taxonomy identification tool using SuperMinHash2 sketching"
 license = "MIT"
-repository = "https://github.com/tu_usuario/bactaxid"
+repository = "https://github.com/irycisBioinfo/BacTaxID"
 keywords = ["bioinformatics", "taxonomy", "sketching", "bacteria", "classification"]
 categories = ["science", "command-line-utilities"]
 
