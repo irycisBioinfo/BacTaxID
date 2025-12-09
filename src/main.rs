@@ -10,6 +10,7 @@ use commands::{init_command, update_command, verify_init_files};  // ADDED
 use commands::update::UpdateArgs;
 use commands::classify::ClassifyArgs;
 use commands::distance::DistanceArgs;  // ADDED
+use commands::extract_sketches::ExtractSketchesArgs;
 
 #[derive(Parser)]
 #[command(name = "bactaxid")]
@@ -40,6 +41,8 @@ enum Commands {
     
     /// Calculates pairwise distances between sequences (read-only)
     Distance(DistanceArgs),  // ADDED
+    /// Export all sketches from DB into JSON
+    ExtractSketches(ExtractSketchesArgs),
 }
 
 fn main() -> Result<()> {
@@ -74,6 +77,11 @@ fn main() -> Result<()> {
             use commands::distance::distance_command;
             distance_command(args)
                 .with_context(|| "Error running distance")?;
+        }
+        Commands::ExtractSketches(args) => {
+            use commands::extract_sketches::extract_sketches_command;
+            extract_sketches_command(args)
+                .with_context(|| "Error running extract_sketches")?;
         }
     }
     

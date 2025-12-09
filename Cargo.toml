@@ -1,6 +1,6 @@
 [package]
 name = "bactaxid"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2021"
 authors = ["Val F. Lanza <valfernandez.vf@gmail.com>, Miguel Diez Fernandez de Bobadilla <migueldiez@outlook.com >"]
 description = "A fast bacterial taxonomy identification tool using SuperMinHash2 sketching"

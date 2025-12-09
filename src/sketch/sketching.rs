@@ -155,6 +155,11 @@ impl SketchManager {
     pub fn contains(&self, signature: u64) -> bool {
         self.sketches.contains_key(&signature)
     }
+
+    /// Returns a cloned Vec of all stored Sketch objects
+    pub fn iter_sketches(&self) -> Vec<Sketch> {
+        self.sketches.values().cloned().collect()
+    }
 }
 
 
