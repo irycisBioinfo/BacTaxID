@@ -164,55 +164,6 @@ pub fn delete_edges_by_ids(
     Ok(())
 }
 
-/// Gets edges from `edges` where source or target is in the signatures slice (both BIGINT)
-/// and dist < dist_max. Returns a vector of (source, target, dist).
-pub fn get_edges_by_signatures_and_dist(
-    conn: &Connection,
-    signatures: &[u64],
-    dist_max: f64,
-) -> Result<Vec<(u64, u64, f64)>> {
-    if signatures.is_empty() {
-        return Ok(Vec::new());
-    }
-    
-    // placeholders ?,?,?,...
-    let placeholders = signatures.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-    let sql = format!(
-        "SELECT source, target, dist FROM edges \
-        WHERE (source IN ({}) OR target IN ({})) AND dist < ?",
-        placeholders, placeholders
-    );
-
-    // Parameters: signatures for source, signatures for target, dist_max
-    let mut params: Vec<&dyn duckdb::ToSql> = Vec::new();
-    
-    // Add signatures for source IN clause
-    for sig in signatures {
-        params.push(sig);
-    }
-    // Add signatures for target IN clause
-    for sig in signatures {
-        params.push(sig);
-    }
-    params.push(&dist_max);
-
-    let mut stmt = conn.prepare(&sql)?;
-    let mut result = Vec::new();
-
-    let rows = stmt.query_map(params.as_slice(), |row| {
-        Ok((
-            row.get::<_, u64>(0)? as u64, // source (BIGINT -> u64)
-            row.get::<_, u64>(1)? as u64, // target (BIGINT -> u64)
-            row.get::<_, f64>(2)?          // dist
-        ))
-    })?;
-
-    for row in rows.flatten() {
-        result.push(row);
-    }
-    Ok(result)
-}
-
 /// Inserts a vector of edges (source, target, dist) into the DuckDB edges table.
 /// 
 /// # Parameters

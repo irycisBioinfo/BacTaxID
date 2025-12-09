@@ -140,45 +140,9 @@ impl SketchManager {
     }
 
 
-    /// Adds a sketch from a FASTA file
-    pub fn add_sketch_from_file<P: AsRef<Path>>(
-        &mut self,
-        fasta_path: P,
-    ) -> Result<()> {
-        let k = self.default_kmer_size;
-        let s = self.default_sketch_size;
-        let sketch = Sketch::new(fasta_path, k, s)?;
-        self.add_sketch(sketch)
-    }
-
-
     /// Gets a sketch by signature
     pub fn get_sketch(&self, signature: u64) -> Option<&Sketch> {
         self.sketches.get(&signature)
-    }
-
-
-    /// Gets a sketch by name (helper function)
-    pub fn get_sketch_by_name(&self, name: &str) -> Option<&Sketch> {
-        self.sketches.values().find(|s| s.name == name)
-    }
-
-
-    /// Removes a sketch by signature
-    pub fn remove_sketch(&mut self, signature: u64) -> Option<Sketch> {
-        self.sketches.remove(&signature)
-    }
-
-
-    /// Lists all available sketch names
-    pub fn list_sketches(&self) -> Vec<String> {
-        self.sketches.values().map(|s| s.name.clone()).collect()
-    }
-
-
-    /// Lists all available sketch signatures
-    pub fn list_signatures(&self) -> Vec<u64> {
-        self.sketches.keys().cloned().collect()
     }
 
 
@@ -190,30 +154,6 @@ impl SketchManager {
 
     pub fn contains(&self, signature: u64) -> bool {
         self.sketches.contains_key(&signature)
-    }
-
-
-    pub fn contains_by_name(&self, name: &str) -> bool {
-        self.sketches.values().any(|s| s.name == name)
-    }
-
-
-    /// Calculates the distance between two sketches by signature
-    pub fn distance_between(&self, sig1: u64, sig2: u64) -> Result<f64> {
-        let sketch1 = self.sketches.get(&sig1)
-            .ok_or_else(|| anyhow!("Sketch with signature '{}' not found", sig1))?;
-
-
-        let sketch2 = self.sketches.get(&sig2)
-            .ok_or_else(|| anyhow!("Sketch with signature '{}' not found", sig2))?;
-
-
-        if !sketch1.is_compatible(sketch2) {
-            anyhow::bail!("Sketches are not compatible (different k-mer or sketch size)");
-        }
-
-
-        Ok(sketch1.distance(sketch2))
     }
 }
 
@@ -381,33 +321,5 @@ pub fn pw_one_to_many(
                 }
             })
         }).collect::<Vec<_>>()
-    }).collect()
-}
-
-
-/// Compares all sketches in `query_manager` against all in `reference_manager`
-/// in parallel, only returning comparisons with distance < max_dist.
-///
-/// # Arguments
-/// - `query_manager`: Reference to the SketchManager containing source (query) sketches.
-/// - `reference_manager`: Reference to the SketchManager containing reference (target) sketches.
-/// - `max_dist`: Maximum distance. Only distances < max_dist are returned.
-///
-/// # Returns
-/// Vector of tuples (source_name, target_name, distance) where distance < max_dist.
-pub fn pw_one_to_all(
-    query_manager: &SketchManager,
-    reference_manager: &SketchManager,
-    max_dist: f64,
-) -> Vec<(String, String, f64)> {
-    query_manager.sketches.par_iter().flat_map(|(_, source_sketch)| {
-        reference_manager.sketches.par_iter().filter_map(move |(_, target_sketch)| {
-            let dist = source_sketch.distance(target_sketch);
-            if dist < max_dist {
-                Some((source_sketch.name.clone(), target_sketch.name.clone(), dist))
-            } else {
-                None
-            }
-        })
     }).collect()
 }
