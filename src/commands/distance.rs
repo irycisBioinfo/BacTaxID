@@ -266,7 +266,7 @@ fn calculate_pairwise_distances_long(
    
 
     let distances: Vec<PairwiseDistance> = (0..n)
-        .into_par_iter()  // ✅ Usa automáticamente el pool global
+        .into_par_iter()  // ✅ Automatically uses the global pool
         .flat_map(|i| {
             let mut results: Vec<PairwiseDistance> = Vec::new();
             
@@ -310,7 +310,7 @@ fn calculate_pairwise_distances_long(
 
             results
         })
-        .collect::<Vec<PairwiseDistance>>();  // ✅ Cierre movido aquí
+        .collect::<Vec<PairwiseDistance>>();  // ✅ Closing moved here
 
 
         Ok(distances)
@@ -584,7 +584,7 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
         println!("ANI Threshold: None (all pairs will be reported)");
     }
 
-           // ✅ CONFIGURAR RAYON CON EL NÚMERO DE CPUS ESPECIFICADO
+           // ✅ CONFIGURE RAYON WITH THE SPECIFIED NUMBER OF CPUS
     ThreadPoolBuilder::new()
         .num_threads(args.cpus)
         .build_global()

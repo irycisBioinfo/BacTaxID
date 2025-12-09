@@ -6,10 +6,10 @@ mod sketch;
 mod graph;
 mod commands;
 
-use commands::{init_command, update_command, verify_init_files};  // AÑADIR
+use commands::{init_command, update_command, verify_init_files};  // ADDED
 use commands::update::UpdateArgs;
 use commands::classify::ClassifyArgs;
-use commands::distance::DistanceArgs;  // AÑADIR
+use commands::distance::DistanceArgs;  // ADDED
 
 #[derive(Parser)]
 #[command(name = "bactaxid")]
@@ -39,7 +39,7 @@ enum Commands {
     Classify(ClassifyArgs),
     
     /// Calculates pairwise distances between sequences (read-only)
-    Distance(DistanceArgs),  // AÑADIR
+    Distance(DistanceArgs),  // ADDED
 }
 
 fn main() -> Result<()> {
@@ -70,7 +70,7 @@ fn main() -> Result<()> {
                 .with_context(|| "Error running classify")?;
         }
         
-        Commands::Distance(args) => {  // AÑADIR
+        Commands::Distance(args) => {  // ADDED
             use commands::distance::distance_command;
             distance_command(args)
                 .with_context(|| "Error running distance")?;

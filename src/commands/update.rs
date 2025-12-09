@@ -232,7 +232,7 @@ pub fn update_single_file(
 
     // -------- 2. Check if signature already exists (via SketchManager, then code.sample) --------
     if _sketch_manager.contains(query.signature) {
-        // Obtener el sample asociado a esta signature desde code (única referencia)
+        // Retrieve the sample associated with this signature from the `code` table (single reference)
         let existing_sample: Option<String> = ctx.connection_mut().query_row(
             "SELECT sample FROM code WHERE signature = ?",
             [query.signature as u64],
@@ -240,18 +240,18 @@ pub fn update_single_file(
         ).unwrap_or(None);
 
         match existing_sample {
-            // Caso A: signature existe y el sample coincide → ignorar sin registrar duplicado
+            // Case A: signature exists and the sample matches -> ignore without recording duplicate
             Some(ref s) if s == &query.sample_name => {
                 println!(
-                    "    • Signature {} ya existe con el mismo sample '{}'. Se ignora este archivo.",
+                    "    • Signature {} already exists with the same sample '{}'. Ignoring this file.",
                     query.signature, query.sample_name
                 );
                 return Ok(ProcessResult::Duplicate);
             }
-            // Caso B: signature existe con sample distinto (o sample NULL/no asignado) → registrar duplicado
+            // Case B: signature exists with a different sample (or sample NULL/not assigned) → record duplicate
             _ => {
                 println!(
-                    "    ⚠️  Signature {} ya existe con sample distinto (DB: {:?}, nuevo: '{}'). Se añade a duplicates.",
+                    "    ⚠️ Signature {} already exists with a different sample (DB: {:?}, new: '{}'). Adding to duplicates.",
                     query.signature, existing_sample, query.sample_name
                 );
                 let duplicate_insert_start = Instant::now();
@@ -659,7 +659,7 @@ pub fn update_duckdb(
     let sample = &query.sample_name;
     let n = query.code.len();
 
-    // Construir la lista de columnas dinámicamente
+    // Build the list of columns dynamically
     let mut columns = vec!["signature".to_string(), "sample".to_string()];
     
     // Build parameter placeholders and values
@@ -804,14 +804,14 @@ pub fn set_clique_code_for_query(
     
     // 1. Get max code value from code table
     let max_code_opt: Option<u64> = if level == 0 {
-        // Para level 0: obtener el máximo de toda la tabla
+        // For level 0: get the maximum across the whole table
         conn.query_row(
             &format!("SELECT MAX({}) FROM code", level_int_col),
             [],
             |r| r.get(0),
         )?
     } else {
-        // Para level > 0: obtener el máximo SOLO dentro del grupo del nivel anterior
+        // For level > 0: get the maximum ONLY within the previous level's group
         let prev_full_col = format!("L_{}_full", level - 1);
         let prev_full = &query.code_full[level - 1];
         conn.query_row(
@@ -827,7 +827,7 @@ pub fn set_clique_code_for_query(
     // 2. Assign code = max_code + 1 and state
     let code_value = max_code_opt.unwrap_or(0) as usize + 1;
     query.code[level] = code_value;
-    query.code_state[level] = "C".to_string();  // "C" para cliques
+    query.code_state[level] = "C".to_string();  // 'C' for cliques
     
     // 3. Build code_full
     if level == 0 {
@@ -914,7 +914,7 @@ pub fn update_command(args: &UpdateArgs) -> Result<()> {
     println!("CPUs: {}", args.cpus);
     println!("Debug: {}", args.debug);
 
-       // ✅ CONFIGURAR RAYON CON EL NÚMERO DE CPUS ESPECIFICADO
+    // ✅ CONFIGURE RAYON WITH THE SPECIFIED NUMBER OF CPUS
     ThreadPoolBuilder::new()
         .num_threads(args.cpus)
         .build_global()

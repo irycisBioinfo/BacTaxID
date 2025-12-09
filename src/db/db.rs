@@ -584,7 +584,7 @@ pub fn get_all_sketch_objects(conn: &Connection) -> Result<Vec<(u64, Sketch)>> {
     let rows = stmt.query_map([], |row| {
         let signature: u64 = row.get(0)?;
         let name: String = row.get(1)?;
-        // UBIGINT[] se devuelve como Vec<u8> o similar, necesitamos convertirlo
+        // UBIGINT[] is returned as Vec<u8> or similar, we need to convert it
         let sketch_data: Vec<u8> = row.get(2)?;
         Ok((signature, name, sketch_data))
     })?;
@@ -607,7 +607,7 @@ pub fn get_all_sketch_objects(conn: &Connection) -> Result<Vec<(u64, Sketch)>> {
             signature,
             name,
             sketch: sketch_array,
-            kmer_size: 0,  // Estos se cargarán desde metadata si es necesario
+            kmer_size: 0,  // These will be loaded from metadata if necessary
             sketch_size: 0,
         };
         
@@ -637,7 +637,7 @@ mod tests {
 fn test_sketches_table_initialization() {
     let db = DuckDb::new(":memory:").expect("Could not create database");
     
-    // ✅ Ya no necesita metadata table
+    // ✅ No longer requires metadata table
     db.init_sketches_table().expect("Could not create sketches table");
 
     let columns_check = "SELECT column_name FROM information_schema.columns WHERE table_name = 'sketches' ORDER BY ordinal_position";

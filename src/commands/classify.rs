@@ -344,7 +344,7 @@ pub fn best_hit(
 
 
 /// Classify a single query file (simplified version of update_single_file)
-/// DETIENE LA BÚSQUEDA cuando no se encuentra un best hit sobre los classifiers
+/// Stops the search when no best hit is found among classifiers
 pub fn classify_single_file(
     fasta_path: &Path,
     ctx: &mut ClassifyCtx,
@@ -399,7 +399,7 @@ pub fn classify_single_file(
                 ref_sigs.len(), classifiers_start.elapsed().as_millis());
         }
         
-        // 3.2 Si no hay classifiers, detener la búsqueda
+        // 3.2 If no classifiers, stop the search
         if ref_db.is_empty() {
             if verbose {
                 println!(" ○ No classifiers found at level {}, stopping classification [{:.2}ms]", 
@@ -422,7 +422,7 @@ pub fn classify_single_file(
                 distances.len(), distances_start.elapsed().as_millis());
         }
         
-        // 3.4 Si no hay distancias válidas, detener la búsqueda
+        // 3.4 If no valid distances, stop the search
         if distances.is_empty() {
             if verbose {
                 println!(" ○ No valid distances at level {}, stopping classification [{:.2}ms]", 
@@ -439,7 +439,7 @@ pub fn classify_single_file(
             println!(" ✓ Best hit calculated [{:.2}ms]", best_hit_start.elapsed().as_millis());
         }
         
-        // 3.6 Si no hay best hit, detener la búsqueda
+        // 3.6 If no best hit, stop the search
         let Some(best_hit_tuple) = bh else {
             if verbose {
                 println!(" ○ No best hit found at level {}, stopping classification [{:.2}ms]", 
@@ -452,7 +452,7 @@ pub fn classify_single_file(
         let code_val = best_hit_tuple.1;
         let code_full_val = best_hit_tuple.2.clone();
         
-        // 3.8 Si el código es 0, detener
+        // 3.8 If code is 0, stop
         if code_val == 0 {
             if verbose {
                 println!(" ○ Best hit has code = 0 at level {}, stopping classification [{:.2}ms]", 
@@ -611,7 +611,7 @@ pub fn classify_command(args: &ClassifyArgs) -> Result<()> {
         println!("Output file: {}", output);
     }
 
-    // ✅ CONFIGURAR RAYON CON EL NÚMERO DE CPUS ESPECIFICADO
+    // ✅ CONFIGURE RAYON WITH THE SPECIFIED NUMBER OF CPUS
     ThreadPoolBuilder::new()
         .num_threads(args.cpus)
         .build_global()
