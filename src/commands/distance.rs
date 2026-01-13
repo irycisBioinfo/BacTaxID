@@ -5,6 +5,7 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::time::Instant;
+use std::sync::Arc;
 use duckdb::Connection;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
@@ -133,7 +134,17 @@ fn load_metadata_map(conn: &Connection) -> Result<HashMap<String, String>> {
     Ok(row)
 }
 
-/// Read sample names from text file
+/// Normalize a sample name by removing hidden/control characters
+fn normalize_sample_name(raw_name: &str) -> String {
+    raw_name
+        .trim()                       // Elimina espacios, \n, \r, \t
+        .trim_matches('\u{FEFF}')     // Elimina BOM (Byte Order Mark)
+        .chars()
+        .filter(|c| !c.is_control())  // Elimina caracteres de control
+        .collect::<String>()
+}
+
+/// Read sample names from text file and normalize them
 fn read_sample_names(ids_file: &str) -> Result<Vec<String>> {
     let start = Instant::now();
     
@@ -142,7 +153,7 @@ fn read_sample_names(ids_file: &str) -> Result<Vec<String>> {
     
     let names: Vec<String> = content
         .lines()
-        .map(|line| line.trim().to_string())
+        .map(|line| normalize_sample_name(line))
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .collect();
     
@@ -157,7 +168,7 @@ fn read_sample_names(ids_file: &str) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// Verify sample locations and build a map of samples to their signatures
+/// Verify sample locations using batch queries (OPTIMIZED)
 /// Handles samples in sketches table, duplicates table, or missing
 fn map_samples_to_signatures(
     conn: &Connection,
@@ -165,55 +176,102 @@ fn map_samples_to_signatures(
 ) -> Result<HashMap<String, SampleLocation>> {
     let start = Instant::now();
     let mut sample_map = HashMap::new();
-    let mut missing_names = Vec::new();
     
-    for name in sample_names {
-        // First, check if sample is in sketches table
-        let sig_in_sketches: Option<u64> = conn.query_row(
-            "SELECT signature FROM sketches WHERE name = ?",
-            [name],
-            |row| row.get(0)
-        ).ok();
+    // Build parameterized query for batch lookup in sketches
+    let placeholders = sample_names.iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    
+    let sketches_query = format!(
+        "SELECT name, signature FROM sketches WHERE name IN ({})",
+        placeholders
+    );
+    
+    // Query all samples from sketches table in one go
+    let mut stmt = conn.prepare(&sketches_query)
+        .context("Error preparing batch sketches query")?;
+    
+    let params: Vec<&dyn duckdb::ToSql> = sample_names.iter()
+        .map(|s| s as &dyn duckdb::ToSql)
+        .collect();
+    
+    let mut rows = stmt.query(&params[..])
+        .context("Error executing batch sketches query")?;
+    
+    let mut found_in_sketches = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(0)?;
+        let sig: u64 = row.get(1)?;
+        found_in_sketches.insert(name.clone(), sig);
+        sample_map.insert(
+            name,
+            SampleLocation::InSketches { signature: sig }
+        );
+    }
+    
+    // Identify samples not found in sketches
+    let not_in_sketches: Vec<&String> = sample_names.iter()
+        .filter(|name| !found_in_sketches.contains_key(*name))
+        .collect();
+    
+    if !not_in_sketches.is_empty() {
+        // Batch query duplicates table
+        let dup_placeholders = not_in_sketches.iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
         
-        if let Some(sig) = sig_in_sketches {
-            sample_map.insert(
-                name.clone(),
-                SampleLocation::InSketches { signature: sig }
-            );
-            continue;
-        }
-        
-        // If not in sketches, check duplicates table
-        let duplicate_info: Option<(u64, String)> = conn.query_row(
-            "SELECT d.signature, s.name 
+        let duplicates_query = format!(
+            "SELECT d.sample, d.signature, s.name 
              FROM duplicates d 
              JOIN sketches s ON d.signature = s.signature 
-             WHERE d.sample = ?",
-            [name],
-            |row| Ok((row.get(0)?, row.get(1)?))
-        ).ok();
+             WHERE d.sample IN ({})",
+            dup_placeholders
+        );
         
-        if let Some((original_sig, original_name)) = duplicate_info {
+        let mut dup_stmt = conn.prepare(&duplicates_query)
+            .context("Error preparing batch duplicates query")?;
+        
+        let dup_params: Vec<&dyn duckdb::ToSql> = not_in_sketches.iter()
+            .map(|s| *s as &dyn duckdb::ToSql)
+            .collect();
+        
+        let mut dup_rows = dup_stmt.query(&dup_params[..])
+            .context("Error executing batch duplicates query")?;
+        
+        let mut found_in_duplicates = HashMap::new();
+        while let Some(row) = dup_rows.next()? {
+            let sample_name: String = row.get(0)?;
+            let original_sig: u64 = row.get(1)?;
+            let original_name: String = row.get(2)?;
+            
+            found_in_duplicates.insert(sample_name.clone(), ());
             sample_map.insert(
-                name.clone(),
+                sample_name,
                 SampleLocation::InDuplicates {
                     original_signature: original_sig,
                     original_name,
                 }
             );
-            continue;
         }
         
-        // Sample not found in either table
-        missing_names.push(name.clone());
-    }
-    
-    if !missing_names.is_empty() {
-        return Err(anyhow!(
-            "The following {} sample names were not found in sketches or duplicates tables: {}",
-            missing_names.len(),
-            missing_names.join(", ")
-        ));
+        // Check for missing samples
+        let missing_names: Vec<String> = not_in_sketches.iter()
+            .filter(|name| !found_in_duplicates.contains_key(**name))
+            .map(|s| (*s).clone())
+            .collect();
+        
+        if !missing_names.is_empty() {
+            for name in &missing_names {
+                eprintln!("⚠️  Sample not found in DB: {:?}", name);
+            }
+            return Err(anyhow!(
+                "The following {} sample names were not found in sketches or duplicates tables: {}",
+                missing_names.len(),
+                missing_names.join(", ")
+            ));
+        }
     }
     
     let duration = start.elapsed();
@@ -252,47 +310,63 @@ fn get_unique_signatures_map(
     sig_to_samples
 }
 
-/// Calculate pairwise distances in long format with duplicate handling
-fn calculate_pairwise_distances_long(
+/// Load sketches into memory wrapped in Arc for efficient sharing
+fn load_sketches_optimized(
     sketch_manager: &SketchManager,
+    signatures: &[u64],
+    verbose: bool,
+) -> Result<HashMap<u64, Arc<Sketch>>> {
+    let start = Instant::now();
+    
+    let sketch_map: HashMap<u64, Arc<Sketch>> = signatures
+        .iter()
+        .filter_map(|&sig| {
+            sketch_manager.get_sketch(sig)
+                .map(|sketch| (sig, Arc::new(sketch.clone())))
+        })
+        .collect();
+    
+    let duration = start.elapsed();
+    
+    if verbose {
+        println!("✓ Loaded {} sketches into memory [{:.2}ms]",
+                 sketch_map.len(), duration.as_millis());
+    }
+    
+    Ok(sketch_map)
+}
+
+/// Calculate pairwise distances in long format (OPTIMIZED)
+fn calculate_pairwise_distances_long(
+    sketch_map: &HashMap<u64, Arc<Sketch>>,
     sample_names: &[String],
     sample_map: &HashMap<String, SampleLocation>,
     threshold: Option<f64>,
-    cpus: usize,
     verbose: bool,
-) -> anyhow::Result<Vec<PairwiseDistance>> {
+) -> Result<Vec<PairwiseDistance>> {
     let n = sample_names.len();
-
-   
-
+    
     let distances: Vec<PairwiseDistance> = (0..n)
-        .into_par_iter()  // ✅ Automatically uses the global pool
+        .into_par_iter()
         .flat_map(|i| {
             let mut results: Vec<PairwiseDistance> = Vec::new();
             
-            // Get signature for sample i (might be from duplicate)
             let loc_i = sample_map.get(&sample_names[i]).expect("Sample not in map");
             let sig_i = match loc_i {
                 SampleLocation::InSketches { signature } => *signature,
                 SampleLocation::InDuplicates { original_signature, .. } => *original_signature,
             };
             
-            let sketch_i = sketch_manager
-                .get_sketch(sig_i)
-                .expect("Sketch not found");
+            let sketch_i = sketch_map.get(&sig_i).expect("Sketch not found");
 
             for j in (i + 1)..n {
-                // Get signature for sample j
                 let loc_j = sample_map.get(&sample_names[j]).expect("Sample not in map");
                 let sig_j = match loc_j {
                     SampleLocation::InSketches { signature } => *signature,
                     SampleLocation::InDuplicates { original_signature, .. } => *original_signature,
                 };
                 
-                let sketch_j = sketch_manager
-                    .get_sketch(sig_j)
-                    .expect("Sketch not found");
-                
+                let sketch_j = sketch_map.get(&sig_j).expect("Sketch not found");
                 let ani = sketch_i.distance(sketch_j);
 
                 if threshold.map_or(true, |thr| ani >= thr) {
@@ -304,74 +378,61 @@ fn calculate_pairwise_distances_long(
                 }
             }
 
-            if verbose && (i + 1) % 10 == 0 {
+            if verbose && (i + 1) % 100 == 0 {
                 println!("  Progress: {}/{} samples processed", i + 1, n);
             }
 
             results
         })
-        .collect::<Vec<PairwiseDistance>>();  // ✅ Closing moved here
+        .collect();
 
+    Ok(distances)
+}
 
-        Ok(distances)
-    }
-
-/// Calculate pairwise distances as full matrix with duplicate handling
+/// Calculate pairwise distances as full matrix (OPTIMIZED)
 fn calculate_pairwise_distances_matrix(
-    sketch_manager: &SketchManager,
+    sketch_map: &HashMap<u64, Arc<Sketch>>,
     sample_names: &[String],
     sample_map: &HashMap<String, SampleLocation>,
-    threads: usize,
     verbose: bool,
-) -> anyhow::Result<Vec<Vec<f64>>> {
+) -> Result<Vec<Vec<f64>>> {
     let n = sample_names.len();
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()
-        .context("Error configuring thread pool")?;
+    let mut matrix: Vec<Vec<f64>> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let mut row = vec![0.0f64; n];
 
-    let mut matrix: Vec<Vec<f64>> = pool.install(|| {
-        (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let mut row = vec![0.0f64; n];
+            let loc_i = sample_map.get(&sample_names[i]).expect("Sample not in map");
+            let sig_i = match loc_i {
+                SampleLocation::InSketches { signature } => *signature,
+                SampleLocation::InDuplicates { original_signature, .. } => *original_signature,
+            };
+            
+            let sketch_i = sketch_map.get(&sig_i).expect("Sketch not found");
 
-                let loc_i = sample_map.get(&sample_names[i]).expect("Sample not in map");
-                let sig_i = match loc_i {
-                    SampleLocation::InSketches { signature } => *signature,
-                    SampleLocation::InDuplicates { original_signature, .. } => *original_signature,
-                };
-                
-                let sketch_i = sketch_manager
-                    .get_sketch(sig_i)
-                    .expect("Sketch not found");
-
-                for j in 0..n {
-                    if i == j {
-                        row[j] = 1.0;
-                    } else if i < j {
-                        let loc_j = sample_map.get(&sample_names[j]).expect("Sample not in map");
-                        let sig_j = match loc_j {
-                            SampleLocation::InSketches { signature } => *signature,
-                            SampleLocation::InDuplicates { original_signature, .. } => *original_signature,
-                        };
-                        
-                        let sketch_j = sketch_manager
-                            .get_sketch(sig_j)
-                            .expect("Sketch not found");
-                        row[j] = sketch_i.distance(sketch_j);
-                    }
+            for j in 0..n {
+                if i == j {
+                    row[j] = 1.0;
+                } else if i < j {
+                    let loc_j = sample_map.get(&sample_names[j]).expect("Sample not in map");
+                    let sig_j = match loc_j {
+                        SampleLocation::InSketches { signature } => *signature,
+                        SampleLocation::InDuplicates { original_signature, .. } => *original_signature,
+                    };
+                    
+                    let sketch_j = sketch_map.get(&sig_j).expect("Sketch not found");
+                    row[j] = sketch_i.distance(sketch_j);
                 }
+            }
 
-                if verbose && (i + 1) % 10 == 0 {
-                    println!("  Progress: {}/{} samples processed", i + 1, n);
-                }
+            if verbose && (i + 1) % 100 == 0 {
+                println!("  Progress: {}/{} samples processed", i + 1, n);
+            }
 
-                row
-            })
-            .collect::<Vec<Vec<f64>>>()
-    });
+            row
+        })
+        .collect();
 
     // Symmetrize lower triangle
     for i in 0..n {
@@ -393,10 +454,8 @@ fn save_distances_tsv_long(
         .with_context(|| format!("Error creating output file: {}", output_file))?;
     let mut writer = BufWriter::new(file);
     
-    // Write header
     writeln!(writer, "Sample1\tSample2\tANI\tANI_percent\tDistance")?;
     
-    // Write distances
     for dist in distances {
         writeln!(
             writer,
@@ -427,10 +486,8 @@ fn save_distances_csv_long(
         .with_context(|| format!("Error creating output file: {}", output_file))?;
     let mut writer = BufWriter::new(file);
     
-    // Write header
     writeln!(writer, "Sample1,Sample2,ANI,ANI_percent,Distance")?;
     
-    // Write distances
     for dist in distances {
         writeln!(
             writer,
@@ -464,11 +521,8 @@ fn save_matrix_phylip(
     
     let n = sample_names.len();
     
-    // Write header (number of taxa)
     writeln!(writer, "{}", n)?;
     
-    // Write matrix rows
-    // PHYLIP format: first 10 characters for name, then distances
     for (i, row) in matrix.iter().enumerate() {
         let name = if sample_names[i].len() > 10 {
             &sample_names[i][..10]
@@ -478,7 +532,6 @@ fn save_matrix_phylip(
         write!(writer, "{:<10}", name)?;
         
         for &value in row {
-            // Convert ANI to distance (1 - ANI)
             let distance = 1.0 - value;
             write!(writer, " {:.6}", distance)?;
         }
@@ -584,15 +637,14 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
         println!("ANI Threshold: None (all pairs will be reported)");
     }
 
-           // ✅ CONFIGURE RAYON WITH THE SPECIFIED NUMBER OF CPUS
+    // Configure Rayon thread pool
     ThreadPoolBuilder::new()
         .num_threads(args.cpus)
         .build_global()
         .context("Error configuring Rayon thread pool")?;
     
     let actual_threads = rayon::current_num_threads();
-    println!("✓ Rayon thread pool configured with {} threads (affects all parallel operations)", 
-             actual_threads);
+    println!("✓ Rayon thread pool configured with {} threads", actual_threads);
     
     // Validate input files
     let validation_start = Instant::now();
@@ -624,7 +676,6 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
             ));
         }
         
-        // Warn if threshold is used with PHYLIP format
         if args.format == "phylip" {
             println!("⚠️  Warning: Threshold is ignored for PHYLIP format (full matrix required)");
         }
@@ -654,7 +705,7 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
     // Read sample names from file
     let sample_names = read_sample_names(&args.ids)?;
     
-    // Map samples to their signatures (handles sketches and duplicates)
+    // Map samples to their signatures (OPTIMIZED: batch queries)
     let sample_map = map_samples_to_signatures(&conn, &sample_names)?;
     
     // Load SketchManager from database
@@ -669,16 +720,26 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
              sketch_manager.length(),
              sketch_load_start.elapsed().as_secs_f32());
     
-    // Verify all required signatures are in SketchManager
+    // Get unique signatures and load sketches into memory
     let sig_to_samples = get_unique_signatures_map(&sample_map);
-    let missing_sigs: Vec<u64> = sig_to_samples.keys()
-        .filter(|sig| !sketch_manager.contains(**sig))
-        .copied()
-        .collect();
+    let unique_signatures: Vec<u64> = sig_to_samples.keys().copied().collect();
     
+    let sketch_map = load_sketches_optimized(
+        &sketch_manager,
+        &unique_signatures,
+        args.verbose
+    )?;
+    
+    // Verify all required signatures are loaded
+    let missing_sigs: Vec<u64> = unique_signatures
+        .iter()
+        .copied()
+        .filter(|sig| !sketch_map.contains_key(sig))  
+        .collect();
+
     if !missing_sigs.is_empty() {
         return Err(anyhow!(
-            "The following {} signatures have no sketches in SketchManager: {:?}",
+            "The following {} signatures have no sketches: {:?}",
             missing_sigs.len(),
             missing_sigs
         ));
@@ -688,11 +749,10 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
     match args.format.as_str() {
         "tsv" => {
             let distances = calculate_pairwise_distances_long(
-                &sketch_manager,
+                &sketch_map,
                 &sample_names,
                 &sample_map,
                 args.threshold,
-                args.cpus,
                 args.verbose
             )?;
             
@@ -705,11 +765,10 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
         
         "csv" => {
             let distances = calculate_pairwise_distances_long(
-                &sketch_manager,
+                &sketch_map,
                 &sample_names,
                 &sample_map,
                 args.threshold,
-                args.cpus,
                 args.verbose
             )?;
             
@@ -722,10 +781,9 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
         
         "phylip" => {
             let matrix = calculate_pairwise_distances_matrix(
-                &sketch_manager,
+                &sketch_map,
                 &sample_names,
                 &sample_map,
-                args.cpus,
                 args.verbose
             )?;
             
@@ -736,7 +794,7 @@ pub fn distance_command(args: &DistanceArgs) -> Result<()> {
             save_matrix_phylip(&args.output, &sample_names, &matrix)?;
         }
         
-        _ => unreachable!(), // Already validated
+        _ => unreachable!(),
     }
     
     let total_duration = command_start.elapsed();
